@@ -1,0 +1,41 @@
+version: 2
+updates:
+  # One workspace, so a single entry with a grouped minor/patch sweep.
+  # Majors stay on their own because they are the ones worth reading.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: [dependencies, rust]
+    commit-message:
+      prefix: "chore(deps)"
+      prefix-development: "chore(deps)"
+    groups:
+      # One pull request per dependency, so a change never mixes unrelated
+      # upgrades and stays easy to revert.
+      routine:
+        patterns: ["*"]
+        update-types: [minor, patch]
+        group-by: dependency-name
+
+  # Same file, different ecosystem: the rsRPC dependency is a git source,
+  # which Dependabot does not version-bump, so rsrpc-version.yml covers it.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    labels: [dependencies, github-actions]
+    commit-message:
+      prefix: "ci(deps)"
+      prefix-development: "ci(deps)"
+    groups:
+      # One pull request per action: a bump that moves two steps of the same
+      # action (init and analyze, say) belongs in a single change.
+      routine:
+        patterns: ["*"]
+        update-types: [minor, patch]
+        group-by: dependency-name

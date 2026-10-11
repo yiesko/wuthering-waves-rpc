@@ -1,0 +1,61 @@
+# CodeQL reads the Rust source directly instead of compiling it, so this
+# job has no build step that a broken lock file or a compile error could
+# take down.
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/**"
+      - "src/**"
+      - "tests/**"
+      - "Cargo.lock"
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+      - "src/**"
+      - "tests/**"
+      - "Cargo.lock"
+  schedule:
+    # Weekly, so queries added to a newer CodeQL release still reach code
+    # that has not changed in a long time.
+    - cron: "30 6 * * 1"
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: ${{ github.ref }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: analyze (rust)
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      # Without this the job cannot upload its results and fails closed.
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [rust]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          # v3 of this action took a single `language`; v4 renamed the input
+          # to `languages` (a list) and rejects the old name outright.
+          languages: rust
+          build-mode: none
+          # The default query suite. `security-extended` is the first thing
+          # to try if the default set comes up quiet on this much `unsafe`.
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          category: "/language:rust"

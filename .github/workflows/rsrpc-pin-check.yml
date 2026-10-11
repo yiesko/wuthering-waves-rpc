@@ -1,0 +1,107 @@
+# Dependabot does not version-bump git dependencies, so it can never move
+# the rsRPC pin. This job covers that gap: it compares the tag in
+# Cargo.toml against the newest tag upstream and opens an issue when they
+# drift apart. It also reports a tag that has disappeared upstream, which
+# is what breaks every fresh clone and CI run.
+name: rsRPC pin check
+
+on:
+  schedule:
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: check pinned tag against upstream
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Compare the pinned tag with the newest upstream tag
+        id: check
+        run: |
+          set -euo pipefail
+
+          url=$(grep -oE 'git = "[^"]+"' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+
+          # wwrpc names rsRPC twice (rsrpc-core and rsrpc-detect). Both tags
+          # must agree, otherwise the lock file can never resolve.
+          tags=$(grep -oE 'tag = "v[^"]+"' Cargo.toml | sed 's/.*"\(.*\)"/\1/' | sort -u)
+          count=$(printf '%s\n' "$tags" | wc -l)
+          if [ "$count" -ne 1 ]; then
+            echo "::error::Cargo.toml pins more than one rsRPC tag:"
+            printf '%s\n' "$tags"
+            exit 1
+          fi
+          pinned=$(printf '%s\n' "$tags")
+
+          remote=$(git ls-remote --tags --refs "$url" 'v*' | awk '{print $2}' | sed 's|refs/tags/||')
+          if [ -z "$remote" ]; then
+            echo "::error::No tags found at $url"
+            exit 1
+          fi
+          latest=$(printf '%s\n' "$remote" | sort -V | tail -1)
+
+          # `sort -V` prints the smaller of the two on the first line, so a
+          # pinned tag that comes back is the one that is behind.
+          oldest=$(printf '%s\n%s\n' "$pinned" "$latest" | sort -V | head -1)
+
+          if ! printf '%s\n' "$remote" | grep -qx "$pinned"; then
+            echo "missing=true" >> "$GITHUB_OUTPUT"
+            echo "::error::Tag $pinned is not published at $url. A fresh clone cannot build."
+          elif [ "$oldest" = "$pinned" ] && [ "$pinned" != "$latest" ]; then
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Pinned $pinned is behind $latest."
+          else
+            echo "stale=false" >> "$GITHUB_OUTPUT"
+            echo "missing=false" >> "$GITHUB_OUTPUT"
+            echo "Pinned $pinned is up to date."
+          fi
+
+          echo "pinned=$pinned" >> "$GITHUB_OUTPUT"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+
+      - name: Open or update the tracking issue
+        if: steps.check.outputs.stale == 'true' || steps.check.outputs.missing == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PINNED: ${{ steps.check.outputs.pinned }}
+          LATEST: ${{ steps.check.outputs.latest }}
+          MISSING: ${{ steps.check.outputs.missing }}
+        run: |
+          set -euo pipefail
+
+          if [ "$MISSING" = "true" ]; then
+            title="rsRPC $PINNED is no longer published upstream"
+            body="The tag pinned in \`Cargo.toml\` is gone from the remote.
+
+            Bump both \`rsrpc-core\` and \`rsrpc-detect\` to \`$LATEST\`. Until then a
+            fresh clone and every clean CI run fail to resolve the dependency."
+          else
+            title="rsRPC $LATEST is available (pinned: $PINNED)"
+            body="Dependabot does not bump git dependencies, so this needs a hand.
+
+            Update both \`rsrpc-core\` and \`rsrpc-detect\` in \`Cargo.toml\` to
+            \`$LATEST\`, then re-read the changelog between $PINNED and $LATEST —
+            the library has had breaking changes before."
+          fi
+
+          existing=$(gh issue list --state open --search "$title in:title" \
+            --json number --jq '.[0].number // empty')
+
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" --title "$title" --body "$body"
+            echo "Updated issue #$existing"
+          else
+            gh issue create --title "$title" --body "$body" \
+              --label dependencies --label rust
+            echo "Opened a new issue."
+          fi
