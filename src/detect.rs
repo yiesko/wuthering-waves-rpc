@@ -10,7 +10,7 @@
 //!
 //! No hardcoded game data: at startup the full Discord detectable
 //! database is fetched online and trimmed with rsRPC's own
-//! [`rsrpc::detection::trim_detectable`], keeping only the Wuthering
+//! [`rsrpc_detect::db::trim_detectable`], keeping only the Wuthering
 //! Waves entry plus a local linux-executable override (Steam AppId
 //! `3513350` covers Steam launches via `/proc/<pid>/environ`; the
 //! override covers Twintail, Heroic, Lutris and plain Wine/Proton,
@@ -18,7 +18,7 @@
 //! fallback. Each tick then runs one synchronous `detect_once` scan over
 //! `/proc`: no threads, no ports, no game files touched.
 
-use rsrpc::{DetectedGame, RPCConfig, RPCServer};
+use rsrpc_core::{Daemon, DetectedGame, RPCConfig};
 
 use crate::log;
 
@@ -73,7 +73,7 @@ pub(crate) fn select_wuwa(body: &str) -> Option<String> {
 /// fetch (refreshes the cache) → stale cache → bundled snapshot. Owns no
 /// threads or sockets; [`Detector::detect`] only scans `/proc`.
 pub struct Detector {
-    server: RPCServer,
+    daemon: Daemon,
 }
 
 impl Detector {
@@ -102,7 +102,7 @@ impl Detector {
                         log::warn(format!(
                             "online database unreachable ({err}); using offline snapshot"
                         ));
-                        select_wuwa(rsrpc::detection::BUNDLED_DETECTABLE).ok_or(
+                        select_wuwa(rsrpc_detect::db::BUNDLED_DETECTABLE).ok_or(
                             "Wuthering Waves missing from the bundled database; update rsrpc?",
                         )?
                     }
@@ -110,7 +110,7 @@ impl Detector {
             },
         };
         let detector = Self {
-            server: RPCServer::from_json_str(json, RPCConfig::default())?,
+            daemon: Daemon::from_json_str(json, RPCConfig::default())?,
         };
         // Return the one-time fetch/parse arenas to the OS: steady state is
         // kilobytes (one scan plus one snapshot copy at a time).
@@ -126,7 +126,7 @@ impl Detector {
     /// game files, sockets or the network.
     pub fn detect(&self) -> Result<Option<DetectedGame>, Box<dyn std::error::Error>> {
         Ok(self
-            .server
+            .daemon
             .detect_once()?
             .into_iter()
             .find(|game| game.id == WUWA_ID))
@@ -172,7 +172,7 @@ fn fetch_online_db() -> Result<String, Box<dyn std::error::Error>> {
         .with_config()
         .limit(64 * 1024 * 1024)
         .read_to_string()?;
-    let trimmed = rsrpc::detection::trim_detectable(&body).unwrap_or(body);
+    let trimmed = rsrpc_detect::db::trim_detectable(&body).unwrap_or(body);
     select_wuwa(&trimmed).ok_or_else(|| "Wuthering Waves missing from the online database".into())
 }
 

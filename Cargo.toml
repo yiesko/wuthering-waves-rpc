@@ -2,7 +2,7 @@
 name = "wwrpc"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.95"
 description = "Wuthering Waves Discord Rich Presence for Linux (Steam/Proton): auto-detects the game, reads Union Level and Region from a RAM copy of LocalStorage, publishes tiered rich presence with character portraits"
 license = "GPL-3.0-only"   # full text in COPYING
 readme = "README.md"
@@ -12,7 +12,11 @@ categories = ["command-line-utilities"]
 
 [dependencies]
 # Git: wwrpc builds against the published fork, never the colocated tree.
-rsrpc = { git = "https://github.com/yiesko/rsRPC.git", tag = "v0.32.0" }
+# rsRPC splits its library into crates since v0.33: rsrpc-core holds the
+# detection engine (Daemon, DetectedGame, RPCConfig) and rsrpc-detect the
+# database helpers. wwrpc needs both, and nothing else from the workspace.
+rsrpc-core = { git = "https://github.com/yiesko/rsRPC.git", tag = "v0.38.0" }
+rsrpc-detect = { git = "https://github.com/yiesko/rsRPC.git", tag = "v0.38.0" }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde_json = "1.0"
 ureq = { version = "3", default-features = false, features = ["rustls", "charset"] }
