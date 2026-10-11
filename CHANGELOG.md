@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- CodeQL workflow: weekly and per-change static analysis of the Rust
+  source. CodeQL reads the code directly, so it adds no build step.
+- Dependabot: weekly pull requests for crates.io dependencies and
+  GitHub Actions, with minor and patch updates grouped per dependency.
+- rsRPC pin check: a weekly job that compares the tag in `Cargo.toml`
+  with the newest tag upstream and opens an issue when they drift.
+  Dependabot cannot do this — it does not version-bump git
+  dependencies — and it also reports a tag that has disappeared.
+
+### Fixed
+- Fresh clones and clean CI runs could not build. The `v0.32.0` tag was
+  never published upstream, so the dependency could not be resolved;
+  local builds only worked because an old copy sat in the cargo cache.
+
+### Changed
+- rsRPC dependency moved from tag `v0.32.0` to `v0.38.0`, and from the
+  single `rsrpc` crate to `rsrpc-core` plus `rsrpc-detect` after the
+  upstream library split into a workspace. `RPCServer` became `Daemon`;
+  detection is still synchronous, so wwrpc still runs no threads and
+  no async runtime of its own.
+- Minimum supported Rust version raised to 1.95, matching rsRPC.
+
 ## [0.2.0] - 2026-09-08
 
 ### Added
