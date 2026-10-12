@@ -14,7 +14,10 @@
 //! private snapshot dir through [`bounded_copy`], which refuses a source past
 //! [`MAX_DB_BYTES`] (past [`MAX_JSON_BYTES`] for the launcher cache), caps
 //! the bytes it moves and proves the source did not change mid-copy. Only
-//! the private copy is queried, and it is deleted right after. From the
+//! the private copy is queried, and it is deleted right after. It is also
+//! opened alone: a sidecar a killed run left beside it is cleared first,
+//! because SQLite reads a leftover journal as a hot one and would
+//! roll its pages back into the copy this tick just made. From the
 //! game's perspective this is indistinguishable from a backup tool: no
 //! SQLite locks are ever taken on the live files.
 //!
@@ -341,9 +344,15 @@ impl DbReader {
         }
         for (src, snap) in &self.sidecars {
             // Best effort: without sidecars a torn copy cannot recover. A
-            // sidecar that is missing, oversized or rewritten mid-copy is
-            // refused before the destination is opened, so the path is left
-            // exactly as it was found.
+            // sidecar that is missing or past the ceiling is refused before
+            // the destination is opened, and one rewritten mid-copy takes its
+            // copy away again — so what the path holds afterwards is this
+            // tick's or nothing, and anything else there is a leftover from a
+            // killed run. A leftover must not be opened with this tick's
+            // snapshot: a `-journal` is not inert data next to a database,
+            // and SQLite reads it as a hot journal and rolls the pages it
+            // holds back into the copy made a moment ago.
+            Self::remove_quiet(snap);
             let _ = bounded_copy(src, snap, MAX_DB_BYTES, DestMode::Overwrite);
         }
 
