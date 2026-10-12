@@ -718,38 +718,6 @@ fn list_accounts_attaches_login_nicknames() {
 }
 
 #[test]
-fn read_last_login_accepts_only_usable_markers() {
-    use std::io::Write as _;
-
-    let dir = unique_dir("last-login");
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("KRSDKUserCache.json");
-    let write = |body: &str| {
-        let mut file = fs::File::create(&path).unwrap();
-        file.write_all(body.as_bytes()).unwrap();
-    };
-
-    write(r#"{"last_login_cuid": "222222222"}"#);
-    assert_eq!(
-        crate::db::read_last_login(&path),
-        Some("222222222".to_string())
-    );
-    // Missing, empty, non-string or garbage: None, never an error.
-    write(r#"{"account_list": []}"#);
-    assert_eq!(crate::db::read_last_login(&path), None);
-    write(r#"{"last_login_cuid": ""}"#);
-    assert_eq!(crate::db::read_last_login(&path), None);
-    write(r#"{"last_login_cuid": 123}"#);
-    assert_eq!(crate::db::read_last_login(&path), None);
-    write("not json");
-    assert_eq!(crate::db::read_last_login(&path), None);
-    assert_eq!(crate::db::read_last_login(&dir.join("missing.json")), None);
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
 fn launcher_cache_path_resolves_steam_layout_only() {
     let root = unique_dir("prefix");
     let _ = fs::remove_dir_all(&root);

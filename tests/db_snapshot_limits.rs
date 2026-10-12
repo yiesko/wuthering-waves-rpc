@@ -241,6 +241,52 @@ fn test_launcher_cache_copy_oversized_rejected() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// Pins the other end of that trade, for the parse itself: a launcher cache
+/// whose bytes are not JSON is unreadable rather than empty, and a listing
+/// that read it still has to come back with every account it triaged. The
+/// nicknames are a recognition aid; a cache the launcher left half-written
+/// must not cost the caller the accounts it came for.
+///
+/// The oversized fixture above covers the copy refusing; this one covers the
+/// parse refusing, which is the branch that has to degrade to a default
+/// instead of ending the call.
+///
+/// What it does not pin is whether the cache was read at all: a parse
+/// failure yields the same empty cache as no cache, so no fixture can tell
+/// the two apart here. A listing that stopped reading the cache altogether
+/// is caught by `list_accounts_attaches_login_nicknames` in `src/tests/db.rs`,
+/// which plants a well-formed one and expects its nickname back.
+#[test]
+fn test_listing_survives_an_unreadable_launcher_cache() {
+    let _lock = list_lock();
+    let root = fixture("unreadable-launcher");
+    let game = root.join("steamapps/common/Wuthering Waves");
+    let storage = game.join("Client/Saved/LocalStorage");
+    fs::create_dir_all(&storage).expect("the storage dir is created");
+    write_account_db(&storage.join("LocalStorage.db"));
+    let cache_dir = root.join(
+        "steamapps/compatdata/3513350/pfx/drive_c/users/steamuser/AppData/Roaming/KR_G153/A1834",
+    );
+    fs::create_dir_all(&cache_dir).expect("the launcher cache dir is created");
+    fs::write(cache_dir.join("KRSDKUserCache.json"), "{ not json at all")
+        .expect("the unreadable launcher cache is written");
+
+    let listed = DbReader::list_accounts(&storage, &game).expect("the listing itself works");
+
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        listed[0].nickname, None,
+        "an unreadable launcher cache yields no nickname"
+    );
+    assert_eq!(
+        listed[0].region, "Europe",
+        "the account the listing came for is still there"
+    );
+    assert_eq!(listed[0].level, "60");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// Pins the per-tick snapshot decision: the same path is re-copied every
 /// tick, so whatever a killed run left there must be replaced, never
 /// mistaken for a snapshot that may not be replaced.

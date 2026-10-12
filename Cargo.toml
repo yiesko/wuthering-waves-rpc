@@ -18,6 +18,13 @@ categories = ["command-line-utilities"]
 rsrpc-core = { git = "https://github.com/yiesko/rsRPC.git", tag = "v0.38.0" }
 rsrpc-detect = { git = "https://github.com/yiesko/rsRPC.git", tag = "v0.38.0" }
 rusqlite = { version = "0.40", features = ["bundled"] }
+# serde_json re-exports none of serde's traits, so a hand-written
+# Deserialize has to name serde itself. The traits used are Deserialize,
+# Deserializer, de::Visitor and de::IgnoredAny; the cache is parsed by hand
+# so an unexpected JSON shape degrades to an absent field rather than a
+# failed read, which a derive cannot express. serde is already in the graph
+# through rsRPC's message decoding, so naming it adds no package.
+serde = "1"
 serde_json = "1.0"
 ureq = { version = "3", default-features = false, features = ["rustls", "charset"] }
 clap = { version = "4", features = ["derive", "help", "usage"] }

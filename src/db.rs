@@ -41,12 +41,16 @@
 //! just as fresh yet re-copies like a tick does, so the mode follows the
 //! caller's intent, not which directory it picked.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
 use crate::log;
@@ -70,6 +74,32 @@ pub const MAX_DB_BYTES: u64 = 64 * 1024 * 1024;
 /// handful of accounts is a few kilobytes, so a megabyte is already
 /// generous.
 pub const MAX_JSON_BYTES: u64 = 1024 * 1024;
+
+/// How many rows one read of a file written by someone else takes in. A
+/// bound on *count*, applied by stopping at it: a telemetry query stops
+/// there, and a cache builds no more entries than this and skips whatever
+/// is left, because a JSON parser has to consume a whole list to know where
+/// it ends — and an entry past the cap is skipped, not built and discarded.
+///
+/// It bounds the role rows a telemetry read looks at and the account rows
+/// the launcher cache hands back. It does **not** bound the account rows
+/// `parse_sdk_accounts` walks out of the game's own database, which are
+/// bounded only by that file's byte ceiling, nor the quest entries
+/// [`parse_quest_count`] counts.
+pub const MAX_ROWS: usize = 500;
+
+/// The longest single display name one read accepts, in characters. A bound
+/// on *length*, and a different act from [`MAX_ROWS`]: an over-long name is
+/// dropped rather than shortened, because a cut name is a different — and
+/// wrong — name shown to a user. A name sitting exactly on the cap is kept
+/// whole, whatever characters it is made of.
+pub const MAX_NAME_CHARS: usize = 32;
+
+/// The longest account identifier one read accepts, in characters. Bounded
+/// for the same reason and in the same way as [`MAX_NAME_CHARS`]: an
+/// identifier this long is not one this program expects to match, so
+/// keeping it would cost memory and map entries and nothing else.
+pub const MAX_CUID_CHARS: usize = 32;
 
 /// Identity + stats of one account, as shown in presence.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -999,7 +1029,7 @@ impl DbReader {
         // Launcher files follow the same copy-to-private-snapshot rule: snapshot
         // them into our scratch dir and read only the copies, never the
         // originals.
-        let (nicknames, last_login) = match launcher_cache_path(game_dir) {
+        let cache = match launcher_cache_path(game_dir) {
             Some(cache_src) if snap_db.parent().is_some() => {
                 let snap_dir = snap_db.parent().expect("snapshot has a parent dir");
                 let snap_cache = snap_dir.join("launcher-cache.json");
@@ -1011,23 +1041,34 @@ impl DbReader {
                     bounded_copy(&cache_src, &snap_cache, MAX_JSON_BYTES, DestMode::Fresh)
                 {
                     log::debug(format!("launcher cache skipped: copy failed ({err})"));
-                    (HashMap::new(), None)
+                    LauncherCache::default()
                 } else {
-                    let nicknames = read_nicknames(&snap_cache);
-                    let last_login = read_last_login(&snap_cache);
+                    // ONE read, ONE parse, both answers: the nicknames and the
+                    // last-login marker are two fields of one file, and a
+                    // second pass is a second walk of bytes this one already
+                    // had. A reader handed a live file would also be reading
+                    // two different versions of it.
+                    let cache = read_launcher_cache(&snap_cache).unwrap_or_else(|err| {
+                        log::debug(format!("launcher cache unreadable: {err}"));
+                        LauncherCache::default()
+                    });
                     let _ = fs::remove_file(&snap_cache);
-                    (nicknames, last_login)
+                    cache
                 }
             }
-            _ => (HashMap::new(), None),
+            _ => LauncherCache::default(),
         };
+        let nicknames = cache.nicknames();
         Ok(accounts
             .into_iter()
             .enumerate()
             .map(|(position, account)| StoredAccount {
                 index: position + 1,
-                nickname: nicknames.get(&account.uid).cloned(),
-                last_login: last_login.as_deref() == Some(account.uid.as_str()),
+                nickname: nicknames
+                    .get(account.uid.as_str())
+                    .copied()
+                    .map(String::from),
+                last_login: cache.last_login_cuid.as_deref() == Some(account.uid.as_str()),
                 region: account.region,
                 level: account.level,
             })
@@ -1178,30 +1219,18 @@ fn time_from_nanos(nanos: i128) -> SystemTime {
     }
 }
 
-/// The launcher's `last_login_cuid`, if parseable. Corroboration marker
-/// ONLY (see below): this file is first-login-sticky and can never
-/// identify the live session, so the value itself is never displayed,
-/// logged, or matched for presence — only compared for equality.
-pub(crate) fn read_last_login(cache_path: &Path) -> Option<String> {
-    let body = fs::read_to_string(cache_path).ok()?;
-    let cache = serde_json::from_str::<Value>(&body).ok()?;
-    match cache.get("last_login_cuid")?.as_str()? {
-        cuid if !cuid.is_empty() => Some(cuid.to_string()),
-        _ => None,
-    }
-}
 /// Display name for one login uid from a PRIVATE telemetry copy: exact
 /// `role_id` match over live `KDData` rows. First match wins; names are
-/// sanity-checked (1–32 chars, no control characters) because they come
-/// from an external writer. Anything off — missing table, bad rows,
-/// absent uid — yields `None`, never an error.
+/// sanity-checked (1–[`MAX_NAME_CHARS`] characters, no control characters)
+/// because they come from an external writer. Anything off — missing table,
+/// bad rows, absent uid — yields `None`, never an error.
 pub(crate) fn query_kd_names(snap: &Path, role_uid: &str) -> Option<String> {
-    const MAX_ROWS: i64 = 500;
-    const MAX_NAME_CHARS: usize = 32;
     let conn = rusqlite::Connection::open(snap).ok()?;
     let mut stmt = conn.prepare("SELECT content FROM KDData LIMIT ?1").ok()?;
     let rows = stmt
-        .query_map([MAX_ROWS], |row| row.get::<_, String>(0))
+        .query_map([i64::try_from(MAX_ROWS).unwrap_or(i64::MAX)], |row| {
+            row.get::<_, String>(0)
+        })
         .ok()?;
     for cell in rows.flatten() {
         let Ok(value) = serde_json::from_str::<Value>(&cell) else {
@@ -1221,9 +1250,7 @@ pub(crate) fn query_kd_names(snap: &Path, role_uid: &str) -> Option<String> {
             continue;
         };
         let name = name.trim().to_string();
-        if !name.is_empty()
-            && name.chars().count() <= MAX_NAME_CHARS
-            && !name.chars().any(char::is_control)
+        if !name.is_empty() && within(&name, MAX_NAME_CHARS) && !name.chars().any(char::is_control)
         {
             return Some(name);
         }
@@ -1341,7 +1368,7 @@ pub(crate) fn find_remnant_role(
                 .map(str::trim)
                 .filter(|name| {
                     !name.is_empty()
-                        && name.chars().count() <= 32
+                        && within(name, MAX_NAME_CHARS)
                         && !name.chars().any(char::is_control)
                 })
                 .map(str::to_string),
@@ -1357,6 +1384,13 @@ pub(crate) fn find_remnant_role(
             properties
                 .and_then(|props| props.get("server_name")?.as_str())
                 .map(str::trim)
+                // 64 bytes, not MAX_NAME_CHARS: a server label is a different
+                // quantity from a display name, and a different length,
+                // from the same external writer — and this one is measured
+                // in bytes, where the name bound beside it counts
+                // characters. Unrelated to MAX_REMANT_CANDIDATES above,
+                // which is the same number and bounds the scan by how many
+                // `"role_id"` markers it steps over.
                 .filter(|region| !region.is_empty() && region.len() <= 64)
                 .map(str::to_string),
         ) else {
@@ -1477,35 +1511,458 @@ pub(crate) fn kddata_path(anywhere: &Path) -> Option<PathBuf> {
     db.is_file().then_some(db)
 }
 
-/// `cuid -> thirdNickName` for accounts that have one. Parses ONLY those
-/// two string fields: mails, tokens and codes are never read, let alone
-/// stored. Any failure yields an empty map.
+/// One account as the launcher's account cache describes it: the two fields
+/// a listing needs, and nothing else.
 ///
-/// Note: the cache's `last_login_cuid` is deliberately ignored — it only
-/// refreshes on logout/login cycles (first-login-sticky), so it can never
-/// identify the live session.
-pub(crate) fn read_nicknames(cache_path: &Path) -> HashMap<String, String> {
-    let Ok(body) = fs::read_to_string(cache_path) else {
-        return HashMap::new();
-    };
-    let Ok(cache) = serde_json::from_str::<Value>(&body) else {
-        return HashMap::new();
-    };
-    let Some(accounts) = cache.get("account_list").and_then(|list| list.as_array()) else {
-        return HashMap::new();
-    };
-    let mut nicknames = HashMap::new();
-    for account in accounts {
-        if let (Some(cuid), Some(nickname)) = (
-            account.get("cuid").and_then(Value::as_str),
-            account.get("thirdNickName").and_then(Value::as_str),
-        ) && !cuid.is_empty()
-            && !nickname.is_empty()
-        {
-            nicknames.insert(cuid.to_string(), nickname.to_string());
-        }
+/// The launcher keeps an e-mail address, a token and verification codes in
+/// the same object, and none of them has a field here. That is the whole
+/// reason this is a struct and not a tree of untyped values: a JSON parser
+/// skips a key it is not asked for without building a value for it, so a
+/// secret this program never asked for has nothing to log, cache or leak —
+/// it is never turned into a value at all.
+///
+/// Both fields are optional because both are independent in the file: an
+/// account may carry a uid and no nickname. Both are also bounded (see
+/// [`MAX_CUID_CHARS`] and [`MAX_NAME_CHARS`]), and a value past its cap
+/// arrives as [`None`] rather than as a shortened one.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct AccountEntry {
+    /// The account uid this row belongs to. A value the launcher wrote as
+    /// something other than a string, or one past [`MAX_CUID_CHARS`],
+    /// arrives as [`None`] rather than as a shortened one.
+    pub cuid: Option<String>,
+    /// The login nickname, under the same rule: a value past
+    /// [`MAX_NAME_CHARS`] arrives as [`None`], never shortened.
+    pub third_nickname: Option<String>,
+}
+
+/// The launcher account cache, as far as this program reads it: which
+/// account the launcher last logged in as, and what it calls the accounts it
+/// knows about.
+///
+/// Nothing here is session truth. The marker only refreshes on a
+/// logout/login cycle, so it can name an account other than the one a
+/// running game is playing: the launcher may have logged into a second one
+/// since. Treat it as a hint a human reads, never as an answer.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct LauncherCache {
+    /// `last_login_cuid`, if it is a usable one: absent, empty, past
+    /// [`MAX_CUID_CHARS`] or not a string all mean no marker at all.
+    /// Compare it for equality and nothing else — never display it, never
+    /// log it, never match presence on it.
+    pub last_login_cuid: Option<String>,
+    /// `account_list`, if the launcher wrote a list there. At most
+    /// [`MAX_ROWS`] entries are kept, the first ones in the file, and an
+    /// entry carrying neither half of a nickname pair is not an account and
+    /// is left out.
+    pub accounts: Option<Vec<AccountEntry>>,
+}
+
+impl LauncherCache {
+    /// Every account here that has both a uid and a nickname, borrowed from
+    /// the cache: what a listing looks a uid up in. An entry missing either
+    /// half, or carrying an empty one, contributes nothing — and these
+    /// fields are public, so this accessor is what decides what "usable"
+    /// means for a cache it did not parse. A value past its cap is already
+    /// dropped from [`Self::accounts`] and cannot appear at all.
+    ///
+    /// Later entries win over earlier ones for the same uid, matching what
+    /// building this map by insertion has always done.
+    pub fn nicknames(&self) -> HashMap<&str, &str> {
+        self.accounts
+            .iter()
+            .flatten()
+            .filter_map(|account| {
+                let (cuid, nickname) =
+                    (account.cuid.as_deref()?, account.third_nickname.as_deref()?);
+                (!cuid.is_empty() && !nickname.is_empty()).then_some((cuid, nickname))
+            })
+            .collect()
     }
-    nicknames
+
+    /// Drop everything the caps forbid — a value past its own length cap
+    /// becomes absent — and the marker when it is empty. Dropping a value
+    /// and truncating a list are different acts: see [`MAX_NAME_CHARS`] for
+    /// this one and [`MAX_ROWS`] for the other, which the parse applies
+    /// rather than here, because an entry past it is never built.
+    fn apply_caps(&mut self) {
+        // An empty marker is no marker: it can only ever compare unequal to a
+        // uid, and keeping it would put an unusable value in a field whose
+        // whole job is to be compared for equality.
+        self.last_login_cuid = self
+            .last_login_cuid
+            .take()
+            .filter(|cuid| !cuid.is_empty() && within(cuid, MAX_CUID_CHARS));
+        let Some(accounts) = &mut self.accounts else {
+            return;
+        };
+        for account in accounts.iter_mut() {
+            account.cuid = account
+                .cuid
+                .take()
+                .filter(|cuid| within(cuid, MAX_CUID_CHARS));
+            account.third_nickname = account
+                .third_nickname
+                .take()
+                .filter(|nickname| within(nickname, MAX_NAME_CHARS));
+        }
+        accounts.retain(|account| account.cuid.is_some() || account.third_nickname.is_some());
+    }
+}
+
+/// Read the launcher account cache at `path`: one bounded read, one parse,
+/// and the two answers a listing needs out of the whole file.
+///
+/// The byte ceiling is enforced on the read itself rather than left to
+/// whoever copies the file, because this function takes whatever path a
+/// caller hands it: the read stops one byte past [`MAX_JSON_BYTES`], so an
+/// oversized file is refused without ever being held whole and without
+/// trusting the size the filesystem reports. A file that is not there, and
+/// bytes that are not JSON, are refused the same way — never half-read,
+/// because a listing prints what it found and half a cache is not what it
+/// found. Every value that does come back is bounded: at most
+/// [`MAX_ROWS`] accounts, at most [`MAX_NAME_CHARS`] characters of nickname,
+/// at most [`MAX_CUID_CHARS`] of cuid.
+///
+/// # Errors
+///
+/// A lowercase [`String`] saying why the cache was refused: it could not be
+/// opened, it could not be read, it is past the byte ceiling, or its bytes
+/// are not JSON. The message carries the reason and the ceiling, never an
+/// account value.
+pub fn read_launcher_cache(path: &Path) -> Result<LauncherCache, String> {
+    // One byte past the ceiling is how the read itself learns the file is
+    // too big: the size the filesystem reports is not trusted, and the
+    // allocation stops at the ceiling instead of growing with the file.
+    let mut file =
+        fs::File::open(path).map_err(|err| format!("cannot open the launcher cache: {err}"))?;
+    let mut body = Vec::new();
+    (&mut file)
+        .take(MAX_JSON_BYTES.saturating_add(1))
+        .read_to_end(&mut body)
+        .map_err(|err| format!("cannot read the launcher cache: {err}"))?;
+    if u64::try_from(body.len()).unwrap_or(u64::MAX) > MAX_JSON_BYTES {
+        return Err(format!(
+            "launcher cache is past the {MAX_JSON_BYTES}-byte ceiling"
+        ));
+    }
+    let mut cache: LauncherCache = serde_json::from_slice(&body)
+        .map_err(|err| format!("launcher cache is not readable JSON: {err}"))?;
+    cache.apply_caps();
+    Ok(cache)
+}
+
+/// Whether a value fits a cap measured in characters, not bytes: a cap this
+/// program counts in characters has to count the same way everywhere.
+fn within(value: &str, max_chars: usize) -> bool {
+    value.chars().count() <= max_chars
+}
+
+// The deserializers below are written out rather than derived, and the
+// reason is the launcher's file, not style. A derived `Deserialize` refuses
+// a document, a list or a value whose JSON type is not the one it expects,
+// and this file is written by an external launcher: every one of those
+// refusals has to come back as an absent field instead, because that is the
+// answer a listing already got when the same file was walked as untyped
+// values. Handling each shape means dispatching on it, which a derive
+// cannot express. What a derive would have given for free — ignoring the
+// keys nobody asked for — is [`IgnoredAny`] below, which consumes those
+// bytes without building a value for them either.
+
+// A text field: the string it holds, or nothing at all for every other JSON
+// type. `null`, a number, an object: all the same answer, and the same one a
+// missing key gives.
+struct Text(Option<String>);
+
+impl<'de> Deserialize<'de> for Text {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        de.deserialize_any(TextVisitor)
+    }
+}
+
+struct TextVisitor;
+
+impl TextVisitor {
+    /// The answer for a value that carries no text. Containers are drained
+    /// rather than dropped, so whatever follows them still parses.
+    fn none<E: de::Error>(self) -> Result<Text, E> {
+        Ok(Text(None))
+    }
+}
+
+impl<'de> Visitor<'de> for TextVisitor {
+    type Value = Text;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a string, or nothing at all")
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Text, E> {
+        Ok(Text(Some(value.to_owned())))
+    }
+
+    fn visit_string<E: de::Error>(self, value: String) -> Result<Text, E> {
+        Ok(Text(Some(value)))
+    }
+
+    fn visit_bool<E: de::Error>(self, _: bool) -> Result<Text, E> {
+        self.none()
+    }
+
+    fn visit_i64<E: de::Error>(self, _: i64) -> Result<Text, E> {
+        self.none()
+    }
+
+    fn visit_u64<E: de::Error>(self, _: u64) -> Result<Text, E> {
+        self.none()
+    }
+
+    fn visit_f64<E: de::Error>(self, _: f64) -> Result<Text, E> {
+        self.none()
+    }
+
+    fn visit_none<E: de::Error>(self) -> Result<Text, E> {
+        self.none()
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Text, E> {
+        self.none()
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Text, A::Error> {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        self.none()
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Text, A::Error> {
+        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+        self.none()
+    }
+}
+
+// The `account_list` value: the accounts it holds, or nothing when the
+// launcher wrote something other than a list there.
+struct Accounts(Option<Vec<AccountEntry>>);
+
+impl<'de> Deserialize<'de> for Accounts {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        de.deserialize_any(AccountsVisitor)
+    }
+}
+
+struct AccountsVisitor;
+
+impl AccountsVisitor {
+    /// The answer for a value that holds no accounts. Containers are drained
+    /// rather than dropped, so whatever follows them still parses.
+    fn none<E: de::Error>(self) -> Result<Accounts, E> {
+        Ok(Accounts(None))
+    }
+}
+
+impl<'de> Visitor<'de> for AccountsVisitor {
+    type Value = Accounts;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a list of account objects")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Accounts, A::Error> {
+        let mut accounts = Vec::new();
+        while let Some(account) = seq.next_element::<AccountEntry>()? {
+            accounts.push(account);
+            if accounts.len() == MAX_ROWS {
+                break;
+            }
+        }
+        // Past the cap the entries are consumed but not built: a JSON parser
+        // has to consume a whole list to know where it ends, and an account
+        // that can never be returned is not worth building.
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(Accounts(Some(accounts)))
+    }
+
+    fn visit_bool<E: de::Error>(self, _: bool) -> Result<Accounts, E> {
+        self.none()
+    }
+
+    fn visit_i64<E: de::Error>(self, _: i64) -> Result<Accounts, E> {
+        self.none()
+    }
+
+    fn visit_u64<E: de::Error>(self, _: u64) -> Result<Accounts, E> {
+        self.none()
+    }
+
+    fn visit_f64<E: de::Error>(self, _: f64) -> Result<Accounts, E> {
+        self.none()
+    }
+
+    fn visit_str<E: de::Error>(self, _: &str) -> Result<Accounts, E> {
+        self.none()
+    }
+
+    fn visit_none<E: de::Error>(self) -> Result<Accounts, E> {
+        self.none()
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Accounts, E> {
+        self.none()
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Accounts, A::Error> {
+        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+        self.none()
+    }
+}
+
+impl<'de> Deserialize<'de> for AccountEntry {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        de.deserialize_any(AccountVisitor)
+    }
+}
+
+struct AccountVisitor;
+
+impl AccountVisitor {
+    /// The answer for a value that is not an account: an object is an
+    /// account, everything else in the list is skipped like an account whose
+    /// two fields are missing. Containers are drained rather than dropped,
+    /// so whatever follows them still parses.
+    fn none<E: de::Error>(self) -> Result<AccountEntry, E> {
+        Ok(AccountEntry::default())
+    }
+}
+
+impl<'de> Visitor<'de> for AccountVisitor {
+    type Value = AccountEntry;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("an account object")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<AccountEntry, A::Error> {
+        let mut account = AccountEntry::default();
+        while let Some(key) = map.next_key::<Cow<'de, str>>()? {
+            match key.as_ref() {
+                "cuid" => account.cuid = map.next_value::<Text>()?.0,
+                "thirdNickName" => account.third_nickname = map.next_value::<Text>()?.0,
+                // The account's e-mail address, its token and its
+                // verification codes live under keys like these. Consuming one
+                // builds no value for it, so there is nothing here to log,
+                // cache or leak.
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(account)
+    }
+
+    fn visit_bool<E: de::Error>(self, _: bool) -> Result<AccountEntry, E> {
+        self.none()
+    }
+
+    fn visit_i64<E: de::Error>(self, _: i64) -> Result<AccountEntry, E> {
+        self.none()
+    }
+
+    fn visit_u64<E: de::Error>(self, _: u64) -> Result<AccountEntry, E> {
+        self.none()
+    }
+
+    fn visit_f64<E: de::Error>(self, _: f64) -> Result<AccountEntry, E> {
+        self.none()
+    }
+
+    fn visit_str<E: de::Error>(self, _: &str) -> Result<AccountEntry, E> {
+        self.none()
+    }
+
+    fn visit_none<E: de::Error>(self) -> Result<AccountEntry, E> {
+        self.none()
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<AccountEntry, E> {
+        self.none()
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<AccountEntry, A::Error> {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        self.none()
+    }
+}
+
+impl<'de> Deserialize<'de> for LauncherCache {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        de.deserialize_any(CacheVisitor)
+    }
+}
+
+struct CacheVisitor;
+
+impl CacheVisitor {
+    /// The answer for a document that is not an object: it describes no
+    /// accounts and no marker. Containers are drained rather than dropped,
+    /// so whatever follows them still parses.
+    fn empty<E: de::Error>(self) -> Result<LauncherCache, E> {
+        Ok(LauncherCache::default())
+    }
+}
+
+impl<'de> Visitor<'de> for CacheVisitor {
+    type Value = LauncherCache;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a launcher account cache object")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<LauncherCache, A::Error> {
+        let mut cache = LauncherCache::default();
+        while let Some(key) = map.next_key::<Cow<'de, str>>()? {
+            match key.as_ref() {
+                "last_login_cuid" => cache.last_login_cuid = map.next_value::<Text>()?.0,
+                "account_list" => cache.accounts = map.next_value::<Accounts>()?.0,
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(cache)
+    }
+
+    fn visit_bool<E: de::Error>(self, _: bool) -> Result<LauncherCache, E> {
+        self.empty()
+    }
+
+    fn visit_i64<E: de::Error>(self, _: i64) -> Result<LauncherCache, E> {
+        self.empty()
+    }
+
+    fn visit_u64<E: de::Error>(self, _: u64) -> Result<LauncherCache, E> {
+        self.empty()
+    }
+
+    fn visit_f64<E: de::Error>(self, _: f64) -> Result<LauncherCache, E> {
+        self.empty()
+    }
+
+    fn visit_str<E: de::Error>(self, _: &str) -> Result<LauncherCache, E> {
+        self.empty()
+    }
+
+    fn visit_none<E: de::Error>(self) -> Result<LauncherCache, E> {
+        self.empty()
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<LauncherCache, E> {
+        self.empty()
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<LauncherCache, A::Error> {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        self.empty()
+    }
 }
 
 /// Game version from the device database (`DeviceSaved/DeviceStorage.db`,
@@ -1539,6 +1996,9 @@ fn read_device_version(storage_dir: &Path, snap_db: &Path) -> Option<String> {
             _ => None,
         })
         .map(|version| version.trim().to_string())
+        // 32 bytes, not [`MAX_NAME_CHARS`]: this is a version string the
+        // game's own writer produces, not a name from an external writer, and
+        // its length is bounded by what that writer emits.
         .filter(|version| !version.is_empty() && version.len() <= 32);
     DbReader::remove_quiet(&snap_copy);
     version
