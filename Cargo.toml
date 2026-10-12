@@ -6,7 +6,7 @@ rust-version = "1.95"
 description = "Wuthering Waves Discord Rich Presence for Linux (Steam/Proton): auto-detects the game, reads Union Level and Region from a private copy of LocalStorage, publishes tiered rich presence with character portraits"
 license = "GPL-3.0-only"   # full text in COPYING
 readme = "README.md"
-repository = "https://github.com/yiesko/wwrpc"
+repository = "https://github.com/yiesko/wuthering-waves-rpc"
 keywords = ["discord", "rich-presence", "wuthering-waves", "linux", "gaming"]
 categories = ["command-line-utilities"]
 

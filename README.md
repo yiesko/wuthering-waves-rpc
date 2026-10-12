@@ -2,7 +2,7 @@
   <h1>wwrpc</h1>
   <p>Wuthering Waves Discord Rich Presence for Linux (Steam/Proton), in Rust</p>
   <p>
-    <a href="https://github.com/yiesko/wwrpc/actions/workflows/ci.yml"><img src="https://github.com/yiesko/wwrpc/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+    <a href="https://github.com/yiesko/wuthering-waves-rpc/actions/workflows/ci.yml"><img src="https://github.com/yiesko/wuthering-waves-rpc/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   </p>
 </div>
 
@@ -50,17 +50,17 @@ What your Discord profile looks like with wwrpc running:
 
 # Install
 
-Requirements: Cargo + Rust 1.88+ (edition 2024).
+Requirements: Cargo + Rust 1.95+ (edition 2024).
 
 ```bash
-cargo install --path wwrpc   # from the repo root → ~/.cargo/bin/wwrpc
+cargo install --locked --path .   # from the repo root → ~/.cargo/bin/wwrpc
 ```
 
 Autostart (systemd user service, no wizard):
 
 ```bash
 mkdir -p ~/.config/systemd/user
-cp wwrpc/assets/wwrpc.service ~/.config/systemd/user/
+cp assets/wwrpc.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now wwrpc.service
 ```
@@ -194,7 +194,7 @@ below) — a personal app also isolates you from community-app changes.
 
 1. [Developer Portal](https://discord.com/developers/applications) →
    New Application → copy the Application ID.
-2. Rich Presence → Art Assets → upload `wwrpc/assets/logo.png` as
+2. Rich Presence → Art Assets → upload `assets/logo.png` as
    `logo` (512×512 original emblem, in this repo; MIT, © 2023 Dawid Szymaniak)
    and each portrait as its lowercase stem (`Denia.png` → `denia`;
    1024×1024 recommended, 512×512 minimum). Rover variants keep their
@@ -222,8 +222,9 @@ level) + official (page linkage).
 This needs the official slot free of *generic* publishers: rsRPC
 ≥ 0.32.0 handles that itself via IPC-wins handoff (its generic card
 shows until this companion publishes, yields, and resumes if the
-companion clears). With older rsRPC, silence the slot instead, e.g.
-`RSRPC_IGNORE_IDS=1247227126416146462` (or `--ignore-ids`).
+companion clears). Keep `RSRPC_IGNORE_IDS=1247227126416146462` (or
+`--ignore-ids`) to fully silence that slot instead; with an older rsRPC
+that has no handoff, it is also how to free the slot.
 The companion uses its own process pid (never the game pid), so both
 slots stay up with distinct bridge identities and clear independently.
 The companion follows the primary: silent stretches and game close

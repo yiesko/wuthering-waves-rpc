@@ -149,8 +149,9 @@ pub struct Args {
     pub character: Option<String>,
 
     /// Companion presence on the official game app for the in-Discord game
-    /// page (same details/state, no custom art). Needs rsRPC (or anything
-    /// else) to NOT publish that slot: set `--ignore-ids` there. Also
+    /// page (same details/state, no custom art). rsRPC ≥ 0.32.0 hands that
+    /// slot over by itself; use its `--ignore-ids` only to silence the slot
+    /// outright, or with an older rsRPC that cannot hand it over. Also
     /// `WWRPC_GAME_PAGE=1`.
     #[arg(long)]
     pub game_page: bool,
