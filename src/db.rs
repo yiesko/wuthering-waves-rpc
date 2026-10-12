@@ -21,13 +21,17 @@
 //! game's perspective this is indistinguishable from a backup tool: no
 //! SQLite locks are ever taken on the live files.
 //!
-//! The copy mode follows the destination directory, not the file. A snapshot
-//! that lands in the private runtime directory is *replaced*: a run killed
-//! mid-copy leaves its file there and nothing ever empties that directory, so
-//! obeying that file would cost every later run its data. A one-shot listing
-//! copies into a [`PrivateTempDir`] built for that single call, where an
-//! entry already on the path is refused rather than adopted — the second
-//! line of defence behind a directory nobody else can write into.
+//! The copy mode is the call site's choice, and what it says is what the
+//! destination must not inherit. The per-tick snapshots land in the private
+//! runtime directory, which nothing ever empties, so they are *replaced*: a
+//! run killed mid-copy leaves its file there, and obeying that file would
+//! cost every later run its data. A one-shot listing copies into a
+//! [`PrivateTempDir`] built for that single call and starts from nothing, so
+//! its copies are [`DestMode::Fresh`] — an entry already on the path is
+//! refused rather than adopted, the second line of defence behind a
+//! directory nobody else can write into. A dry run's scratch directory is
+//! just as fresh yet re-copies like a tick does, so the mode follows the
+//! caller's intent, not which directory it picked.
 
 use std::collections::HashMap;
 use std::fs;
