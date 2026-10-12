@@ -77,8 +77,9 @@ fn write_patch_version_db(path: &Path) {
     .expect("the patch version row is written");
 }
 
-/// Stretch `path` one byte past `limit` without writing the bytes: the file
-/// grows, stays readable, and costs nothing to create.
+/// Stretch `path` one byte past `limit` without writing the bytes: whatever
+/// the file already holds stays readable at its front, and the extension
+/// itself costs nothing.
 fn grow_past(path: &Path, limit: u64) {
     let file = File::options()
         .write(true)
@@ -128,7 +129,7 @@ fn list_dirs() -> Vec<PathBuf> {
 fn test_device_version_rejects_oversized() {
     let root = fixture("device");
     let storage = root.join("Client/Saved/LocalStorage");
-    fs::create_dir_all(&storage).unwrap();
+    fs::create_dir_all(&storage).expect("the storage dir is created");
     write_account_db(&storage.join("LocalStorage.db"));
 
     // `DeviceSaved` sits next to `LocalStorage` under the game's `Saved` dir.
@@ -136,7 +137,8 @@ fn test_device_version_rejects_oversized() {
         .parent()
         .expect("the storage dir has a parent")
         .join("DeviceSaved/DeviceStorage.db");
-    fs::create_dir_all(device.parent().expect("the device dir has a parent")).unwrap();
+    fs::create_dir_all(device.parent().expect("the device dir has a parent"))
+        .expect("the device dir is created");
     write_patch_version_db(&device);
     grow_past(&device, MAX_DB_BYTES);
 
@@ -169,7 +171,7 @@ fn test_query_list_rejects_oversized() {
     let _lock = list_lock();
     let root = fixture("list");
     let storage = root.join("Client/Saved/LocalStorage");
-    fs::create_dir_all(&storage).unwrap();
+    fs::create_dir_all(&storage).expect("the storage dir is created");
     let db = storage.join("LocalStorage.db");
     write_account_db(&db);
     grow_past(&db, MAX_DB_BYTES);
@@ -197,7 +199,7 @@ fn test_launcher_cache_copy_oversized_rejected() {
     let root = fixture("launcher");
     let game = root.join("steamapps/common/Wuthering Waves");
     let storage = game.join("Client/Saved/LocalStorage");
-    fs::create_dir_all(&storage).unwrap();
+    fs::create_dir_all(&storage).expect("the storage dir is created");
     write_account_db(&storage.join("LocalStorage.db"));
     write_oversized_launcher_cache(&root);
 
@@ -219,11 +221,12 @@ fn test_launcher_cache_copy_oversized_rejected() {
 fn test_snapshot_overwrites_a_stale_copy() {
     let root = fixture("stale");
     let storage = root.join("Client/Saved/LocalStorage");
-    fs::create_dir_all(&storage).unwrap();
+    fs::create_dir_all(&storage).expect("the storage dir is created");
     write_account_db(&storage.join("LocalStorage.db"));
     let snap = root.join("snapshots");
-    fs::create_dir_all(&snap).unwrap();
-    fs::write(snap.join("snapshot.db"), b"whatever a killed run left").unwrap();
+    fs::create_dir_all(&snap).expect("the snapshot dir is created");
+    fs::write(snap.join("snapshot.db"), b"whatever a killed run left")
+        .expect("the leftover snapshot is written");
 
     let mut reader = DbReader::new(storage.clone(), snap.clone(), None).expect("the reader opens");
 
@@ -234,6 +237,47 @@ fn test_snapshot_overwrites_a_stale_copy() {
     );
     assert!(
         !snap.join("snapshot.db").exists(),
+        "the snapshot is removed after the tick that read it"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Pins the mode at a snapshot that lives in the private runtime directory:
+/// that directory is never emptied, so a file a killed run left behind must
+/// be replaced. Refusing it instead would cost the game version every later
+/// run, silently. The leftover is grown sparse so the test costs nothing.
+#[test]
+fn test_device_version_replaces_a_stale_copy() {
+    let root = fixture("stale-device");
+    let storage = root.join("Client/Saved/LocalStorage");
+    fs::create_dir_all(&storage).expect("the storage dir is created");
+    write_account_db(&storage.join("LocalStorage.db"));
+
+    let device = storage
+        .parent()
+        .expect("the storage dir has a parent")
+        .join("DeviceSaved/DeviceStorage.db");
+    fs::create_dir_all(device.parent().expect("the device dir has a parent"))
+        .expect("the device dir is created");
+    write_patch_version_db(&device);
+
+    let snap = root.join("snapshots");
+    fs::create_dir_all(&snap).expect("the snapshot dir is created");
+    let orphan = snap.join("device.db");
+    fs::write(&orphan, b"torn").expect("the leftover snapshot is written");
+    grow_past(&orphan, MAX_DB_BYTES);
+
+    let mut reader = DbReader::new(storage.clone(), snap.clone(), None).expect("the reader opens");
+
+    assert_eq!(reader.refresh(), Refresh::Updated);
+    assert_eq!(
+        reader.cached_version(),
+        Some("3.6.13"),
+        "a leftover snapshot must be replaced, not obeyed"
+    );
+    assert!(
+        !orphan.exists(),
         "the snapshot is removed after the tick that read it"
     );
 

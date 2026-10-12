@@ -17,6 +17,13 @@
 //! the private copy is queried, and it is deleted right after. From the
 //! game's perspective this is indistinguishable from a backup tool: no
 //! SQLite locks are ever taken on the live files.
+//!
+//! The copy mode follows the destination directory, not the file. A snapshot
+//! that lands in the private runtime directory is *replaced*: a run killed
+//! mid-copy leaves its file there and nothing ever empties that directory, so
+//! obeying that file would cost every later run its data. A one-shot listing
+//! copies into a directory built for that single call, where an entry already
+//! on the path is refused rather than adopted.
 
 use std::collections::HashMap;
 use std::fs;
@@ -332,7 +339,8 @@ impl DbReader {
         for (src, snap) in &self.sidecars {
             // Best effort: without sidecars a torn copy cannot recover. A
             // sidecar that is missing, oversized or rewritten mid-copy is
-            // skipped, and the snapshot it would have filled stays absent.
+            // refused before the destination is opened, so the path is left
+            // exactly as it was found.
             let _ = bounded_copy(src, snap, MAX_DB_BYTES, DestMode::Overwrite);
         }
 
@@ -575,9 +583,10 @@ impl DbReader {
         let kd_src = kddata_path(self.game_dir.as_ref()?)?;
         let snap_dir = self.snap_db.parent()?;
         let snap_copy = snap_dir.join("kdnames.db");
-        // Read by this one lookup and removed right after, so it must start
-        // from nothing rather than inherit whatever is on the path.
-        bounded_copy(&kd_src, &snap_copy, MAX_DB_BYTES, DestMode::Fresh).ok()?;
+        // Replaced, never obeyed: this lookup owns the path, and the runtime
+        // directory is never emptied, so a copy a killed run left behind
+        // would otherwise refuse every lookup after it.
+        bounded_copy(&kd_src, &snap_copy, MAX_DB_BYTES, DestMode::Overwrite).ok()?;
         let name = query_kd_names(&snap_copy, role_uid);
         Self::remove_quiet(&snap_copy);
         name
@@ -600,11 +609,12 @@ impl DbReader {
             return none;
         };
         let snap_copy = snap_dir.join("kdremnant.db");
-        // Read by this one scan and removed right after, so it must start from
-        // nothing rather than inherit whatever is on the path. A copy refused
-        // here (too large, rewritten mid-copy) reads its reason from the
-        // error, the way the size check used to report it.
-        if let Err(err) = bounded_copy(&kd_src, &snap_copy, MAX_DB_BYTES, DestMode::Fresh) {
+        // Replaced, never obeyed: this scan owns the path, and the runtime
+        // directory is never emptied, so a copy a killed run left behind
+        // would refuse every scan after it. A refusal that still happens (too
+        // large, rewritten mid-copy) reads its reason from the error, the way
+        // the size check used to report it.
+        if let Err(err) = bounded_copy(&kd_src, &snap_copy, MAX_DB_BYTES, DestMode::Overwrite) {
             log::debug(format!("telemetry scan skipped: copy failed ({err})"));
             return none;
         }
@@ -679,8 +689,13 @@ impl DbReader {
                 let snap_dir = snap_db.parent().expect("snapshot has a parent dir");
                 let snap_cache = snap_dir.join("launcher-cache.json");
                 // A JSON cache gets its own, much smaller ceiling: the real
-                // file holds a handful of accounts in a few kilobytes.
-                if bounded_copy(&cache_src, &snap_cache, MAX_JSON_BYTES, DestMode::Fresh).is_err() {
+                // file holds a handful of accounts in a few kilobytes. A
+                // refusal costs the nicknames, never the listing, and says
+                // why instead of failing in silence.
+                if let Err(err) =
+                    bounded_copy(&cache_src, &snap_cache, MAX_JSON_BYTES, DestMode::Fresh)
+                {
+                    log::debug(format!("launcher cache skipped: copy failed ({err})"));
                     (HashMap::new(), None)
                 } else {
                     let nicknames = read_nicknames(&snap_cache);
@@ -1036,7 +1051,10 @@ fn read_device_version(storage_dir: &Path, snap_db: &Path) -> Option<String> {
     let snap_copy = snap_db.parent()?.join("device.db");
     // Nothing else bounds this file: a runaway device database must be
     // refused here, not copied into the snapshot directory byte by byte.
-    bounded_copy(&device_src, &snap_copy, MAX_DB_BYTES, DestMode::Fresh).ok()?;
+    // Replaced, never obeyed, like every snapshot in the runtime
+    // directory: nothing ever empties that directory, so a copy a killed run
+    // left behind would leave the version unreadable for the whole session.
+    bounded_copy(&device_src, &snap_copy, MAX_DB_BYTES, DestMode::Overwrite).ok()?;
     let version = rusqlite::Connection::open(&snap_copy)
         .ok()
         .and_then(|conn| {
