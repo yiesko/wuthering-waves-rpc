@@ -21,62 +21,82 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use wwrpc::runtime_dir::{PrivateTempDir, create_private_file, runtime_dir};
 
-/// Serializes the whole file: each test reads or writes
-/// `XDG_RUNTIME_DIR`, directly or through [`runtime_dir`].
+/// Environment variable this file manipulates to pick the runtime base.
+const XDG: &str = "XDG_RUNTIME_DIR";
+
+/// Environment variable `std::env::temp_dir()` honors. Set by the fallback
+/// tests to sandbox the shared temp dir instead of touching the real `/tmp`.
+const TMPDIR: &str = "TMPDIR";
+
+/// Serializes the whole file: each test reads or writes these variables,
+/// directly or through [`runtime_dir`].
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-/// Holds [`ENV_LOCK`] and restores `XDG_RUNTIME_DIR` to its previous value
-/// on drop, so a test may set, blank or unset it freely.
+/// Holds [`ENV_LOCK`] and restores every variable it touched on drop, so a
+/// test may set or unset them freely.
 struct EnvGuard {
     _lock: MutexGuard<'static, ()>,
-    previous: Option<OsString>,
+    saved: Vec<(&'static str, Option<OsString>)>,
 }
 
 impl EnvGuard {
-    /// Acquire the file-wide env lock and snapshot `XDG_RUNTIME_DIR`.
+    /// Acquire the file-wide env lock and snapshot the managed variables.
     fn new() -> Self {
         // A panicking test must not wedge every later test in this file.
         let lock = ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        Self {
-            _lock: lock,
-            previous: std::env::var_os("XDG_RUNTIME_DIR"),
-        }
+        let saved = [XDG, TMPDIR]
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect();
+        Self { _lock: lock, saved }
     }
 
-    /// Point `XDG_RUNTIME_DIR` at `value` for the rest of the test.
-    fn set(&self, value: &str) {
+    /// Point `key` at `value` for the rest of the test.
+    fn set(&self, key: &str, value: &str) {
         // SAFETY: only this guard mutates the env (the file-wide lock is
-        // held for the test's whole life) and the value only steers path
+        // held for the test's whole life) and the values only steer path
         // selection inside `runtime_dir`.
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", value) };
+        unsafe { std::env::set_var(key, value) };
     }
 
-    /// Unset `XDG_RUNTIME_DIR` for the rest of the test.
-    fn clear(&self) {
+    /// Unset `key` for the rest of the test.
+    fn clear(&self, key: &str) {
         // SAFETY: same invariant as [`EnvGuard::set`].
-        unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
+        unsafe { std::env::remove_var(key) };
     }
 }
 
 impl Drop for EnvGuard {
     fn drop(&mut self) {
-        // SAFETY: restoring the snapshot taken before the test ran, still
+        // SAFETY: restoring the snapshots taken before the test ran, still
         // under the lock this guard holds.
         unsafe {
-            match &self.previous {
-                Some(value) => std::env::set_var("XDG_RUNTIME_DIR", value),
-                None => std::env::remove_var("XDG_RUNTIME_DIR"),
+            for (key, previous) in &self.saved {
+                match previous {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
             }
         }
     }
 }
 
 /// Per-process fixture directory; unique per tag so the tests of this file
-/// never share state.
+/// never share state. Call it before pointing `TMPDIR` into a sandbox: the
+/// path comes from the real temp dir.
 fn fixture(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!("wwrpc-rt-{}-{tag}", std::process::id()))
+}
+
+/// Expected fallback path under `base`: `wwrpc-<uid>`, the naming rule that
+/// keeps one account from squatting a shared temp dir.
+fn expected_fallback(base: &Path) -> PathBuf {
+    let uid = std::fs::metadata("/proc/self")
+        .map(|meta| std::os::unix::fs::MetadataExt::uid(&meta))
+        .expect("our own /proc entry is readable");
+    base.join(format!("wwrpc-{uid}"))
 }
 
 /// Permission bits (`mode & 0o777`) of `path`, following symlinks as the
@@ -96,7 +116,7 @@ fn test_runtime_dir_creates_private_dir() {
     let base = fixture("valid");
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).unwrap();
-    env.set(base.to_str().expect("temp dir is utf-8"));
+    env.set(XDG, base.to_str().expect("temp dir is utf-8"));
 
     let dir = runtime_dir().expect("runtime_dir succeeds under a valid base");
 
@@ -110,55 +130,73 @@ fn test_runtime_dir_creates_private_dir() {
 }
 
 /// Pins that empty and relative `XDG_RUNTIME_DIR` values are ignored: the
-/// result is an absolute fallback path, and nothing is created relative to
-/// the working directory.
+/// result is the shared temp-dir fallback path, and nothing is created
+/// relative to the working directory.
 #[test]
 fn test_runtime_dir_rejects_empty_and_relative() {
     let env = EnvGuard::new();
+    // Sandbox the fallback: the test must never touch the real `/tmp`.
+    let sandbox = fixture("relative");
+    let _ = std::fs::remove_dir_all(&sandbox);
+    std::fs::create_dir_all(&sandbox).unwrap();
+    env.set(TMPDIR, sandbox.to_str().expect("temp dir is utf-8"));
 
-    env.set("");
+    env.set(XDG, "");
     let dir = runtime_dir().expect("an empty base must fall back, not fail");
     assert!(
         dir.is_absolute(),
         "an empty base must not be used: '{}'",
         dir.display()
     );
+    assert_eq!(
+        dir,
+        expected_fallback(&sandbox),
+        "an empty base must use the per-uid fallback"
+    );
 
-    env.set("relative/path");
+    env.set(XDG, "relative/path");
     let dir = runtime_dir().expect("a relative base must fall back, not fail");
     assert!(
         dir.is_absolute(),
         "a relative base must not be used: '{}'",
         dir.display()
     );
+    assert_eq!(
+        dir,
+        expected_fallback(&sandbox),
+        "a relative base must use the per-uid fallback"
+    );
     assert!(
         !Path::new("wwrpc").exists(),
         "a relative base must not create ./wwrpc in the working directory"
     );
+
+    let _ = std::fs::remove_dir_all(&sandbox);
 }
 
 /// Pins that with no `XDG_RUNTIME_DIR` at all the module returns the shared
 /// system temp dir fallback, named per uid (`wwrpc-<uid>`) so one account
-/// cannot squat it — and leaves the shared temp dir as it found it.
+/// cannot squat the plain name. `TMPDIR` sandboxes the fallback, so nothing
+/// outside the fixture is created or removed.
 #[test]
 fn test_runtime_dir_falls_back_without_env() {
     let env = EnvGuard::new();
-    env.clear();
+    let sandbox = fixture("fallback");
+    let _ = std::fs::remove_dir_all(&sandbox);
+    std::fs::create_dir_all(&sandbox).unwrap();
+    env.clear(XDG);
+    env.set(TMPDIR, sandbox.to_str().expect("temp dir is utf-8"));
 
-    let uid = std::fs::metadata("/proc/self")
-        .map(|meta| std::os::unix::fs::MetadataExt::uid(&meta))
-        .expect("our own /proc entry is readable");
     let dir = runtime_dir().expect("a missing base falls back to temp_dir");
 
     assert_eq!(
         dir,
-        std::env::temp_dir().join(format!("wwrpc-{uid}")),
+        expected_fallback(&sandbox),
         "the shared fallback must be named after the uid"
     );
     assert_eq!(mode_of(&dir), 0o700, "the fallback dir is owner-only");
 
-    // Leave the shared temp dir as we found it.
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&sandbox);
 }
 
 /// Pins that a held [`PrivateTempDir`] exists, is 0700 and carries the
@@ -169,7 +207,7 @@ fn test_private_temp_dir_is_private_and_cleaned() {
     let base = fixture("private");
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).unwrap();
-    env.set(base.to_str().expect("temp dir is utf-8"));
+    env.set(XDG, base.to_str().expect("temp dir is utf-8"));
 
     let temp = PrivateTempDir::new("t").expect("temp dir is created");
     let path = temp.path().to_path_buf();
@@ -199,7 +237,7 @@ fn test_private_temp_dir_new_is_unique() {
     let base = fixture("unique");
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).unwrap();
-    env.set(base.to_str().expect("temp dir is utf-8"));
+    env.set(XDG, base.to_str().expect("temp dir is utf-8"));
 
     let first = PrivateTempDir::new("u").expect("first temp dir");
     let second = PrivateTempDir::new("u").expect("second temp dir");
@@ -265,7 +303,7 @@ fn test_runtime_dir_refuses_symlinked_runtime_dir() {
     let target = base.join("target");
     std::fs::create_dir_all(&target).unwrap();
     std::os::unix::fs::symlink(&target, base.join("wwrpc")).unwrap();
-    env.set(base.to_str().expect("temp dir is utf-8"));
+    env.set(XDG, base.to_str().expect("temp dir is utf-8"));
 
     let err = runtime_dir().expect_err("a symlinked runtime dir must be refused");
 
@@ -289,7 +327,7 @@ fn test_runtime_dir_repairs_mode_drift() {
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(base.join("wwrpc")).unwrap();
     std::fs::set_permissions(base.join("wwrpc"), std::fs::Permissions::from_mode(0o777)).unwrap();
-    env.set(base.to_str().expect("temp dir is utf-8"));
+    env.set(XDG, base.to_str().expect("temp dir is utf-8"));
 
     let dir = runtime_dir().expect("our own loose dir is repaired, not refused");
 
@@ -309,7 +347,7 @@ fn test_runtime_dir_rebuilds_missing_base() {
     let env = EnvGuard::new();
     let base = fixture("stale");
     let _ = std::fs::remove_dir_all(&base);
-    env.set(base.to_str().expect("temp dir is utf-8"));
+    env.set(XDG, base.to_str().expect("temp dir is utf-8"));
 
     let dir = runtime_dir().expect("a missing base is rebuilt");
 
