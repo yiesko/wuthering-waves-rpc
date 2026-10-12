@@ -249,10 +249,13 @@ pub fn run(args: Args) -> Result<(), Box<dyn Error>> {
     if args.list_accounts {
         // A listing is a read of the database by definition, so the gate
         // above resolved it for this run — whatever else shares the
-        // command line with it.
+        // command line with it. That leaves the fallback below unreachable,
+        // and it stays as a reported error rather than a panic: a gate that
+        // ever stops resolving a listing has to say so on its own. The
+        // invariant behind it is pinned in `src/tests/gating.rs`.
         let (game_dir, storage_dir) = game_files
             .as_ref()
-            .ok_or("--list-accounts lists what the game files hold; drop --no-database")?;
+            .ok_or("--list-accounts reached without the game files its gate resolved")?;
         return print_accounts(game_dir, storage_dir);
     }
 

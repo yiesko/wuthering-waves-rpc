@@ -4,6 +4,7 @@
 mod character;
 mod db;
 mod detect;
+mod gating;
 mod ipc;
 mod log;
 mod presence;
