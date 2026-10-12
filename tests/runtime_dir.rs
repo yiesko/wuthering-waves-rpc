@@ -138,7 +138,8 @@ fn test_runtime_dir_rejects_empty_and_relative() {
 }
 
 /// Pins that with no `XDG_RUNTIME_DIR` at all the module still returns the
-/// system temp dir fallback, absolute and under `temp_dir()`.
+/// system temp dir fallback — absolute, under `temp_dir()`, and named per
+/// uid so no single account can squat it.
 #[test]
 fn test_runtime_dir_falls_back_without_env() {
     let env = EnvGuard::new();
@@ -146,12 +147,21 @@ fn test_runtime_dir_falls_back_without_env() {
 
     let dir = runtime_dir().expect("a missing base falls back to temp_dir");
 
-    assert_eq!(dir, std::env::temp_dir().join("wwrpc"));
     assert!(
-        dir.is_absolute(),
-        "the fallback must be absolute: '{}'",
+        dir.is_absolute() && dir.starts_with(std::env::temp_dir()),
+        "the fallback must be absolute and under temp_dir: '{}'",
         dir.display()
     );
+    let name = dir
+        .file_name()
+        .expect("the fallback path has a final component")
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        name.starts_with("wwrpc-") && name != "wwrpc",
+        "the shared fallback must be named per uid, got '{name}'"
+    );
+    assert_eq!(mode_of(&dir), 0o700, "the fallback dir is owner-only");
 }
 
 /// Pins that a held [`PrivateTempDir`] exists, is 0700 and carries the

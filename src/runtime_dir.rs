@@ -16,7 +16,9 @@
 //!   even a strange umask cannot widen them.
 //! - `$XDG_RUNTIME_DIR` counts only when it is absolute; empty or relative
 //!   values fall back to the system temp dir with a warning, because shared
-//!   `/tmp` is neither private nor tmpfs.
+//!   `/tmp` is neither private nor tmpfs. That fallback names the directory
+//!   after the uid (`wwrpc-<uid>`), so one account cannot squat the name
+//!   and lock every other user out of it.
 //! - An existing runtime dir is audited: a symlink, a non-directory or a
 //!   directory owned by another user is refused (anyone can pre-create an
 //!   entry in shared `/tmp`), and a directory we own has its `0700` mode
@@ -58,7 +60,7 @@ const XDG_RUNTIME_DIR: &str = "XDG_RUNTIME_DIR";
 const NAME_ATTEMPTS: u32 = 64;
 
 /// The wwrpc runtime directory: `<XDG_RUNTIME_DIR>/wwrpc`, or
-/// `<temp_dir>/wwrpc` when that variable is unusable.
+/// `<temp_dir>/wwrpc-<uid>` when that variable is unusable.
 ///
 /// The entry is created exclusively and then audited: a symlink, a
 /// non-directory or a directory owned by another user is refused, which is
@@ -73,7 +75,7 @@ const NAME_ATTEMPTS: u32 = 64;
 /// user.
 pub fn runtime_dir() -> io::Result<PathBuf> {
     let base = runtime_base();
-    let dir = base.join(RUNTIME_SUBDIR);
+    let dir = base.join(runtime_subdir(&base));
     match create_private_dir(&dir) {
         Ok(()) => {}
         // A set-but-stale `XDG_RUNTIME_DIR` (login manager gone) is rebuilt
@@ -225,6 +227,18 @@ fn runtime_base() -> PathBuf {
         fallback.display()
     ));
     fallback
+}
+
+/// Directory name inside the runtime base. The shared temp-dir fallback is
+/// per-user (`wwrpc-<uid>`): any local account can create an entry in
+/// `/tmp`, so a single name would let the first one there lock every other
+/// user out of the fallback path entirely. `$XDG_RUNTIME_DIR` is already
+/// per-user by spec, so it keeps the plain `wwrpc` name.
+fn runtime_subdir(base: &Path) -> String {
+    if base == std::env::temp_dir() {
+        return format!("{RUNTIME_SUBDIR}-{}", current_uid());
+    }
+    RUNTIME_SUBDIR.to_string()
 }
 
 /// Refuse a runtime directory that is not safe to use: a symlink (the
