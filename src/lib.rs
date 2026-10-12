@@ -30,6 +30,8 @@
 //! - [`lock`]: single-instance pid-file guard.
 //! - [`log`]: levelled stderr logging (`--verbose`/`--quiet`, `WWRPC_*`).
 //! - [`presence`]: pure payload builders + the publish-tier decision.
+//! - [`runtime_dir`]: private runtime directory (0700 dirs, 0600 files,
+//!   symlink refusal, RAII temp dirs).
 //!
 //! Privacy rule across every module: account values (uids, names, levels)
 //! never reach logs — only shapes (counts, booleans, ages).
@@ -41,6 +43,7 @@ pub mod ipc;
 pub mod lock;
 pub mod log;
 pub mod presence;
+pub mod runtime_dir;
 
 #[cfg(test)]
 mod tests;
