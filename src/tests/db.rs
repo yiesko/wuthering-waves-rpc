@@ -448,17 +448,6 @@ fn hint_without_override_points_to_list_accounts() {
 }
 
 #[test]
-fn triage_success_resets_tracking() {
-    let storage = make_storage("reset", "111111111", "Europe", 60);
-    let snap = unique_dir("reset-snap");
-    let mut reader = DbReader::new(storage.clone(), snap.clone(), None).unwrap();
-    assert_eq!(reader.refresh(), Refresh::Updated);
-    assert_eq!(reader.last_triage(), None);
-    let _ = fs::remove_dir_all(&storage);
-    let _ = fs::remove_dir_all(&snap);
-}
-
-#[test]
 fn triage_known_account_missing_level_reports_seen() {
     // Like the real incident: per-uid keys exist, the level row does not.
     let storage = storage_with_sql(

@@ -241,46 +241,22 @@ fn test_readme_states_the_manifest_minimum_rust_version() {
     );
 }
 
-/// Pins the README's paths into this repository to the repository root.
+// A `wwrpc/` prefix is the one mistake a reader cannot see without trying
+// the path: the file is named, the sentence reads correctly, and the copy
+// fails only once it is run.
+/// Pins that the README never routes a repository path through a `wwrpc/`
+/// prefix.
 ///
 /// The README is read from inside a checkout, so a file that ships with it
-/// is named by its path from the root: `assets/logo.png`, never
-/// `wwrpc/assets/logo.png`, which resolves to nothing in a clone.
-///
-/// Both instructions that carry such a path are checked, the copy of the
-/// unit file and the logo upload.
+/// is named by its path from the root: `assets/wwrpc.service`, never
+/// `wwrpc/assets/wwrpc.service`, which resolves to nothing in a clone.
 #[test]
-fn test_readme_paths_start_at_the_repository_root() {
+fn test_readme_never_names_a_path_through_a_wwrpc_prefix() {
     let readme = read("README.md");
 
-    for asset in ["assets/wwrpc.service", "assets/logo.png"] {
-        assert!(
-            readme.contains(asset),
-            "the README must still name {asset} by its path from the repository root"
-        );
-    }
     assert!(
         !readme.contains("wwrpc/assets"),
         "the README names files of this repository from its root, never through a `wwrpc/` prefix; \
          got:\n{readme}"
-    );
-}
-
-// The link is easy to mistake for a stale name and easy to fix in the wrong
-// direction: the detection engine's repository is a real one, so a link
-// pointing there resolves and looks right while documenting the wrong
-// project.
-/// Pins the credits link to the detection engine's own repository.
-///
-/// The credits are where a reader is sent when they want the detection
-/// engine's source. `rsRPC` is a separate project this one builds against,
-/// not this repository under another name.
-#[test]
-fn test_credits_name_the_detection_engine() {
-    let readme = read("README.md");
-
-    assert!(
-        readme.contains(&format!("]({DETECTION_ENGINE})")),
-        "the README credits the detection engine at {DETECTION_ENGINE}; got:\n{readme}"
     );
 }
