@@ -8,6 +8,13 @@
 
 //! LocalStorage reader with copy-to-a-private-snapshot semantics.
 //!
+//! A tick copies only when something a snapshot is built from was written
+//! since the last one it accepted, and that set is the account database
+//! together with the SQLite sidecars beside it ([`snapshot_signature`]).
+//! The main file alone is not the set: a game running in WAL mode commits
+//! its rows into `-wal` and leaves the main file's timestamp standing
+//! still.
+//!
 //! Safety model: the live game files
 //! are NEVER opened with SQLite, never written to, never chmodded and
 //! never kept open. Each tick we copy `LocalStorage.db` (+ journal) into a
@@ -36,8 +43,9 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
@@ -189,12 +197,50 @@ pub struct DbReader {
     /// triage outcome: every enrichment complements the others, so a
     /// failed level triage must not take the version down with it.
     cached_version: Option<String>,
-    last_mtime: Option<SystemTime>,
+    /// Signature of the account database and its sidecars at the last
+    /// accepted snapshot, so a tick can tell whether anything a snapshot
+    /// is built from was written since (see [`snapshot_signature`]).
+    /// Written only where a snapshot is accepted, never on a copy that
+    /// was refused or discarded.
+    last_signature: Option<FileSignature>,
     last: Option<PlayerInfo>,
     degraded: bool,
-    /// Last reported triage failure, to log each distinct reason once
-    /// instead of spamming every tick while it persists.
-    last_reported: Option<TriageError>,
+    /// Why the last warning was printed, to log each distinct reason once
+    /// instead of spamming every tick while it persists. One slot rather
+    /// than one per kind, because a tick reports at most one reason and
+    /// two that alternate are two separate events to warn about, not one
+    /// condition to merge.
+    last_reported: Option<Reported>,
+    /// Ticks that printed the unmeasurable-source-set warning, so a test
+    /// can count what the deduplication is for. Test-only; the production
+    /// reader has no use for it.
+    #[cfg(test)]
+    signature_warnings: usize,
+}
+
+/// Why a tick degraded and said so. One line per distinct reason, so the
+/// log can hold what a reader needs: a fault that persists is reported
+/// once, and one that clears is reported again if it returns.
+///
+/// A signature failure and a triage failure cannot happen in the same tick
+/// — the first stops the tick before the second is reached — so they are
+/// variants rather than a concatenation, and the deduplication is on the
+/// variant. They are not the same condition either, and merging them would
+/// hide one behind the other: a tick whose signature is unmeasurable and a
+/// tick whose triage failed need different answers from whoever is reading.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Reported {
+    /// A snapshot was taken and rejected by triage.
+    Triage(TriageError),
+    /// The source set could not be measured, so the tick published nothing
+    /// new. Carries nothing else: the message is built from the error
+    /// itself, which names the file that could not be read, and the
+    /// deduplication is on this variant alone. One sidecar becoming
+    /// unmeasurable while another already is therefore not reported on its
+    /// own — the two are one record until a snapshot succeeds and clears
+    /// it. The fault is still announced either way; only a second line
+    /// naming a second file is not.
+    Signature,
 }
 
 impl DbReader {
@@ -234,10 +280,12 @@ impl DbReader {
             telemetry_names: TelemetryCache::new(),
             telemetry_remnants: TelemetryCache::new(),
             cached_version: None,
-            last_mtime: None,
+            last_signature: None,
             last: None,
             degraded: false,
             last_reported: None,
+            #[cfg(test)]
+            signature_warnings: 0,
         })
     }
 
@@ -295,7 +343,32 @@ impl DbReader {
     /// observability for the log-dedup state machine (`src/tests/db.rs`).
     #[cfg(test)]
     pub(crate) fn last_triage(&self) -> Option<TriageError> {
-        self.last_reported
+        match &self.last_reported {
+            Some(Reported::Triage(err)) => Some(*err),
+            _ => None,
+        }
+    }
+
+    /// Why the reader last warned, or `None` if it has not. Test-only
+    /// observability: the warnings themselves go to the process's stderr,
+    /// which a test cannot read, so this exposes the record that decides
+    /// whether one is printed.
+    #[cfg(test)]
+    pub(crate) fn last_warning(&self) -> Option<&'static str> {
+        match &self.last_reported {
+            Some(Reported::Triage(_)) => Some("triage"),
+            Some(Reported::Signature) => Some("signature"),
+            None => None,
+        }
+    }
+
+    /// How many times this reader has printed the "cannot tell whether the
+    /// game wrote" warning. Test-only, and counted here rather than
+    /// intercepted from the log: a counter beside the emission is what a
+    /// test can read, where the line itself goes to a process's stderr.
+    #[cfg(test)]
+    pub(crate) fn signature_warnings(&self) -> usize {
+        self.signature_warnings
     }
 
     /// One poll tick. Never fails hard: every problem degrades to
@@ -338,7 +411,54 @@ impl DbReader {
             Err(_) => return self.cached_or_unavailable(),
         };
 
-        if self.last_mtime == Some(mtime) && self.last.is_some() {
+        // "Has anything been written to the account database, or to the
+        // sidecars a snapshot of it is built from, since the last snapshot
+        // this reader accepted?" — a question about the whole set, because
+        // the set is what the snapshot holds. A game running in WAL mode
+        // commits its rows into `-wal` and leaves this database's timestamp
+        // standing still, and a decision made from the main file alone
+        // would call that unchanged and keep serving the older snapshot.
+        //
+        // Strict where the sidecar copy loop is lenient: a copy that
+        // cannot be made is best effort (a snapshot missing a sidecar is
+        // still worth reading), but a signature that cannot be taken means
+        // this reader cannot tell whether a file was written, and guessing
+        // "unchanged" is how a stale snapshot outlives the write that
+        // superseded it. The cost runs the other way from that loop's — an
+        // unmeasurable sidecar holds the tick at its last data until the
+        // file is readable again — which is why it is announced rather than
+        // left to a debug line, and why the two must not be read as one
+        // thing: the copy loop's warning is about a sidecar it could not
+        // CLEAR, and the tick carries on either way.
+        let signature = match snapshot_signature(&self.storage_dir) {
+            Ok(signature) => signature,
+            Err(err) => {
+                // Loud, once. Deduped exactly like triage failures: a
+                // condition that persists is worth one line, and one that
+                // clears and returns is worth another.
+                //
+                // The line says the tick publishes nothing new rather than
+                // that it holds previous data, because the two are not the
+                // same: a fault present from the start has no previous data
+                // to hold, and "holding" would describe a snapshot that
+                // does not exist.
+                if self.last_reported != Some(Reported::Signature) {
+                    self.last_reported = Some(Reported::Signature);
+                    #[cfg(test)]
+                    {
+                        self.signature_warnings += 1;
+                    }
+                    log::warn(format!(
+                        "cannot tell whether the game wrote to its database \
+                         ({err}); this tick publishes nothing new until that \
+                         file can be read again"
+                    ));
+                }
+                return self.cached_or_unavailable();
+            }
+        };
+
+        if self.last_signature == Some(signature) && self.last.is_some() {
             log::debug("snapshot unchanged since last tick; reusing data");
             return Refresh::Unchanged;
         }
@@ -346,16 +466,16 @@ impl DbReader {
         // Display-name tracking shares the account database's cadence. The
         // login a name is resolved against lives in that database, so a tick
         // finding it unchanged has no new login to resolve for — and the
-        // other tick that reaches this line, the one where the timestamp
-        // still matches but no snapshot has been accepted, has nothing to
-        // resolve for either. A rename waits for the next tick that database
-        // does change, which a running game produces on its own. The trade is
-        // deliberate: telemetry rows are written at login and deleted once
-        // uploaded, so re-reading them every tick meant re-copying a file
-        // nobody had written to be told, most of the time, that there was
-        // still no name in it. What the lookup reads is a separate question
-        // with its own answer — the telemetry file's signature (see
-        // `refresh_display_name`).
+        // other tick that reaches this line, the one where nothing the
+        // snapshot is built from has changed but no snapshot has been
+        // accepted, has nothing to resolve for either. A rename waits for
+        // the next tick that database does change, which a running game
+        // produces on its own. The trade is deliberate: telemetry rows are
+        // written at login and deleted once uploaded, so re-reading them
+        // every tick meant re-copying a file nobody had written to be told,
+        // most of the time, that there was still no name in it. What the
+        // lookup reads is a separate question with its own answer — the
+        // telemetry file's signature (see `refresh_display_name`).
         self.refresh_display_name();
 
         // The same destination is re-copied every tick, so whatever a killed
@@ -373,25 +493,48 @@ impl DbReader {
         }
         for (src, snap) in &self.sidecars {
             // Best effort: without sidecars a torn copy cannot recover, and a
-            // source that is missing, oversized or rewritten mid-copy is
-            // refused before the destination is opened, so the path holds
-            // this tick's copy or nothing — but only once the leftover a
-            // killed run left has been cleared, which is what the removal
-            // below does first. Skipping it would leave a `-journal` in
-            // place: not inert data beside a database, since SQLite reads
-            // one as a hot journal and rolls the pages it holds back into
-            // the copy made a moment ago. A removal that itself fails is
-            // warned about rather than made fatal — the next tick tries
-            // again, while refusing the snapshot would cost the reader's
-            // data for the whole session.
+            // source that is missing or oversized is refused before the
+            // destination is opened at all — one is not there to read, the
+            // other is measured and refused before a byte is written. A
+            // source rewritten under the copy is caught afterwards instead,
+            // and what it leaves on the destination is unlinked rather than
+            // kept. Either way the path holds this tick's copy or nothing,
+            // but only once the leftover a killed run left has been cleared,
+            // which is what the removal below does first. Skipping it would
+            // leave a `-journal` in place: not inert data beside a database,
+            // since SQLite reads one as a hot journal and rolls the pages it
+            // holds back into the copy made a moment ago. A removal that
+            // itself fails is warned about rather than made fatal — the next
+            // tick tries again, while refusing the snapshot would cost the
+            // reader's data for the whole session.
             Self::remove_before_copy(snap);
             let _ = bounded_copy(src, snap, MAX_DB_BYTES, DestMode::Overwrite);
         }
 
         // Discard torn copies: the game must not have touched the source while
-        // we were reading it. The copy itself already rejects a source that
-        // changed underneath it; this check still covers the sidecars copied
-        // after it.
+        // we were reading it. A different question from the change
+        // signature this tick was gated on, which asked whether anything has
+        // changed since the last accepted snapshot — this one asks about the
+        // handful of milliseconds the copy just took, and folding the
+        // sidecars into it would make an ordinary commit discard a good
+        // snapshot instead of noticing it.
+        //
+        // Every copy here, sidecars included, already re-measures its own
+        // source through the handle the bytes came from. What that handle
+        // cannot see is the name: a source replaced by a rename while we were
+        // copying it keeps the same inode and the same contents, so only a
+        // stat of the path notices. This asks exactly that, of the main
+        // database — the file a torn snapshot is built on. A sidecar swapped
+        // the same way is left to the copy that read it, and the limit is
+        // worth stating plainly rather than dressing up: each file that
+        // lands is a whole version of itself, so no snapshot is ever torn
+        // *within* a file, but the set as a whole can then describe two
+        // instants — this tick's database beside the sidecar the path held
+        // a moment ago. That is a cheaper price than the alternative, which
+        // is discarding the snapshot on every tick a game happens to commit,
+        // and it is a price the next tick undoes: the fold measures
+        // whatever is at the path then, so the sidecar that arrived in the
+        // meantime is what the following snapshot is taken against.
         let unchanged = fs::metadata(&self.src_db)
             .and_then(|m| m.modified())
             .map(|after| after == mtime)
@@ -445,7 +588,7 @@ impl DbReader {
         match outcome {
             Ok((mut info, _)) => {
                 info.game_version = self.cached_version.clone();
-                self.last_mtime = Some(mtime);
+                self.last_signature = Some(signature);
                 self.last = Some(info);
                 self.last_reported = None;
                 // The login this tick revealed was unknown to the call above,
@@ -501,7 +644,7 @@ impl DbReader {
                version attached: {}",
                             self.cached_version.is_some()
                         ));
-                        self.last_mtime = Some(mtime);
+                        self.last_signature = Some(signature);
                         self.last_reported = None;
                         self.last = Some(PlayerInfo {
                             uid: live,
@@ -519,8 +662,8 @@ impl DbReader {
                 }
                 // One line per distinct reason; a persistent condition (game
                 // mid-write, unknown account, ...) must not spam every tick.
-                if self.last_reported != Some(err) {
-                    self.last_reported = Some(err);
+                if self.last_reported != Some(Reported::Triage(err)) {
+                    self.last_reported = Some(Reported::Triage(err));
                     log::warn(format!(
                         "LocalStorage triage failed ({err}); {}",
                         self.hint(err)
@@ -555,13 +698,13 @@ impl DbReader {
     /// Display-name tracking: when this runs, and what it re-reads, are two
     /// separate questions. The call rides the account database's cadence —
     /// [`DbReader::refresh`] makes it whenever that database is about to be
-    /// read again (its timestamp moved, or no snapshot has been accepted yet)
-    /// and once more if triage takes the copy it just made — while the lookup
-    /// the call performs is gated on the *telemetry* database's own signature.
-    /// Telemetry churns on its own schedule, so the lookup runs whenever that
-    /// file was written since the last time, and is skipped entirely while it
-    /// stands still, whether the answer was a name or the far more common
-    /// "no name in these rows".
+    /// read again (its signature moved, or no snapshot has been accepted
+    /// yet) and once more if triage takes the copy it just made — while the
+    /// lookup the call performs is gated on the *telemetry* database's own
+    /// signature. Telemetry churns on its own schedule, so the lookup runs
+    /// whenever that file was written since the last time, and is skipped
+    /// entirely while it stands still, whether the answer was a name or the
+    /// far more common "no name in these rows".
     ///
     /// A signature says nothing about which login asked, so a login switch
     /// has to drop the caches itself. [`DbReader::refresh`] is where that
@@ -892,6 +1035,149 @@ impl DbReader {
     }
 }
 
+/// One version of everything a per-tick snapshot is built from: the
+/// account database at `dir`/`LocalStorage.db` and the SQLite sidecars
+/// beside it, folded into the single value a tick compares against the one
+/// its last accepted snapshot was taken at.
+///
+/// The main database is required; a sidecar is not, and one that is absent
+/// contributes nothing rather than failing the call. That contribution can
+/// never be confused with a sidecar that is present but empty.
+///
+/// The fold is not injective — different file sets can produce the same
+/// value — so a caller must not read equality as proof that nothing was
+/// written. A collision needs both halves to coincide at once, a main
+/// database exactly as many bytes shorter and timestamps that add up to
+/// the very same nanosecond, and it costs one skipped copy until the next
+/// write rather than a wrong answer. Nor does a signature here say anything
+/// a signature anywhere does not: a rewrite leaving a file's length and
+/// modification time exactly where they were is not a change.
+///
+/// # Errors
+///
+/// [`io::ErrorKind::NotFound`] when the main database is not there, and
+/// whatever measuring a file failed with otherwise, untouched in kind. An
+/// absent sidecar is the one absence that is not an error.
+pub fn snapshot_signature(dir: &Path) -> io::Result<FileSignature> {
+    // The main database first, and on its own terms: it is the file a
+    // snapshot is built on, and nothing here substitutes for it.
+    let (mut mtime, mut len) = signature_part(&dir.join(MAIN_DB))?;
+    for suffix in SIDECAR_SUFFIXES {
+        // The same names `DbReader::new` builds its sidecar pairs from, so
+        // the fold and the copy can never disagree about which files a
+        // snapshot is made of.
+        match signature_part(&dir.join(format!("{MAIN_DB}{suffix}"))) {
+            Ok((part_mtime, part_len)) => {
+                mtime = mtime.saturating_add(part_mtime);
+                len = len.saturating_add(part_len);
+            }
+            // The sentinel: a file the game does not keep contributes
+            // nothing at all. A game in rollback-journal mode keeps no
+            // `-wal` and no `-shm` at all, and that is the ordinary state
+            // of a database nobody has opened yet, not a fault — the fold
+            // neither fails nor invents a version for such a file.
+            //
+            // Only absence is the sentinel. A sidecar that is there and
+            // cannot be measured — a changed permission, a symlink loop, an
+            // untraversable parent — is a different observation, and
+            // folding it into the sentinel would stop the caller noticing a
+            // file that exists, which is the one thing a signature is for.
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+    // Both totals saturate rather than wrap, and neither can fold an
+    // absurd file back onto an ordinary value.
+    //
+    // The time total cannot saturate at all: every part is the span
+    // between two `SystemTime` values, at most a `u64` of seconds and so
+    // about 1.8e28 nanoseconds, which four of them reach 7.4e28 — more
+    // than nine orders of magnitude short of what this accumulator holds.
+    // A maintainer who widens the file set has to re-derive that bound
+    // rather than trust the arithmetic. The clamps behind it are a
+    // backstop, and `nanos_since_epoch` says why they would stay honest
+    // if they were ever reached.
+    //
+    // The length total is a `u64`, and one file of `u64::MAX` bytes already
+    // drives it to the ceiling, so its clamp is a real bound and not an
+    // unreachable one. It takes 18.45 exabytes to reach, which is above
+    // the ceiling of every filesystem in use (ext4 stops at 16 TiB, xfs at
+    // 8 EiB); at or past it every such set folds alike.
+    //
+    // The fold buys skipped copies and can also spend one, and which way
+    // that runs is worth knowing before trusting the value. A `-shm` is
+    // the shared index SQLite keeps beside a write-ahead log, derived
+    // from the log and rewritten by whoever holds the database open, so a
+    // game reading its own rows can leave the set looking rewritten with
+    // no row changed. Which sidecars the dependency stamps in that case
+    // is its business and not this crate's to rely on either way:
+    // measured against the SQLite built into this binary, plain reads
+    // leave the index's timestamp alone, while another build stamps it.
+    // The direction is the safe one — a signature that moves when no row
+    // did costs a copy of a database that did not change, never a
+    // snapshot that was needed and not taken.
+    Ok(FileSignature::new(time_from_nanos(mtime), len))
+}
+
+/// One file's contribution to [`snapshot_signature`]: its modification
+/// time in nanoseconds since the epoch, and its length plus one.
+///
+/// The plus one is the presence bit [`snapshot_signature`] describes: it is
+/// the difference between a file of no bytes and no file at all.
+fn signature_part(path: &Path) -> io::Result<(i128, u64)> {
+    // Tagged with its own path, because the underlying error names none:
+    // "No such file or directory (os error 2)" is not something an operator
+    // can act on when three sidecars are in question. The kind survives the
+    // wrap, which is what the caller's `NotFound` branch matches on.
+    let meta = fs::metadata(path).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("cannot measure '{}': {err}", path.display()),
+        )
+    })?;
+    let mtime = meta
+        .modified()
+        .map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("cannot read the time of '{}': {err}", path.display()),
+            )
+        })
+        .map(nanos_since_epoch)?;
+    Ok((mtime, meta.len().saturating_add(1)))
+}
+
+/// Nanoseconds since the epoch, signed: a time before 1970 counts
+/// negative, so a set of files can still be added up whatever the clock
+/// says about any one of them. The negative branch is ordinary code, not a
+/// formality — a Linux filesystem records timestamps from before the
+/// epoch, so a game file stamped there reads back as a negative count of
+/// seconds and lands here.
+fn nanos_since_epoch(time: SystemTime) -> i128 {
+    // Neither conversion can fail: `as_nanos` on a `Duration` is at most
+    // about 1.8e28, far inside `i128`. The fallbacks are a backstop, and
+    // they are chosen so that the negative one negates to `-i128::MAX`
+    // rather than the accumulator's own floor — that way a part meeting
+    // its opposite still sums to zero instead of clamping onto a neighbour.
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(since) => i128::try_from(since.as_nanos()).unwrap_or(i128::MAX),
+        Err(before) => -i128::try_from(before.duration().as_nanos()).unwrap_or(i128::MAX),
+    }
+}
+
+/// A [`nanos_since_epoch`] total back as a time: the same instants added
+/// back up, saturating at both ends rather than panicking on a date no
+/// filesystem records.
+fn time_from_nanos(nanos: i128) -> SystemTime {
+    let magnitude = u64::try_from(nanos.unsigned_abs()).unwrap_or(u64::MAX);
+    let duration = Duration::from_nanos(magnitude);
+    if nanos < 0 {
+        UNIX_EPOCH.checked_sub(duration).unwrap_or(UNIX_EPOCH)
+    } else {
+        UNIX_EPOCH.checked_add(duration).unwrap_or(UNIX_EPOCH)
+    }
+}
+
 /// The launcher's `last_login_cuid`, if parseable. Corroboration marker
 /// ONLY (see below): this file is first-login-sticky and can never
 /// identify the live session, so the value itself is never displayed,
@@ -980,7 +1266,7 @@ const MAX_REMANT_CANDIDATES: usize = 64;
 /// no way to tell a fresh event from a stale one.
 fn epoch_millis() -> Option<u64> {
     SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+        .duration_since(UNIX_EPOCH)
         .ok()
         .and_then(|since| u64::try_from(since.as_millis()).ok())
 }
@@ -1468,7 +1754,8 @@ pub(crate) fn check_schema(conn: &rusqlite::Connection) -> Result<(), TriageErro
     }
 }
 
-/// Fast corruption gate: catches torn copies the mtime check may miss.
+/// Fast corruption gate: catches torn copies the mid-copy mtime check may
+/// miss.
 pub(crate) fn check_integrity(conn: &rusqlite::Connection) -> Result<(), TriageError> {
     let status: String = conn
         .query_row("PRAGMA quick_check", [], |row| row.get(0))

@@ -361,6 +361,18 @@ fn test_tick_survives_a_sidecar_it_cannot_clear() {
 /// falls back; once it is gone the next tick copies and triages as if
 /// nothing had happened, with no restart and no operator action. That is what
 /// makes a failed clear worth a warning rather than a refusal.
+///
+/// The degraded half asserts the dependency, not this program, and a reader
+/// should not take it for anything else. A directory where a `-journal`
+/// belongs is read by the bundled SQLite as a journal it cannot open: every
+/// statement against that snapshot then fails with `SQLITE_IOERR`, and the
+/// verdict below is that error arriving as an unreadable snapshot. A future
+/// SQLite that handled the entry differently would fail this test loudly
+/// rather than leave it quietly true, which is the only honest way for an
+/// assertion about someone else's code to break. The `-shm` of the test
+/// above is planted precisely because it is ignored beside a snapshot in
+/// rollback-journal mode, which leaves that one asserting this program's
+/// rule and nothing else.
 #[test]
 fn test_the_next_tick_recovers_from_a_stuck_sidecar() {
     let root = fixture("stuck-then-gone");

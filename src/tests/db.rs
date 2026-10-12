@@ -101,7 +101,7 @@ fn quest_count_counts_entries_per_uid() {
 }
 
 #[test]
-fn refresh_reads_copy_and_caches_by_mtime() {
+fn refresh_reads_copy_and_caches_by_signature() {
     let storage = make_storage("basic", "111111111", "Europe", 60);
     let snap = unique_dir("basic-snap");
     let mut reader = DbReader::new(storage.clone(), snap.clone(), None).unwrap();
@@ -112,7 +112,7 @@ fn refresh_reads_copy_and_caches_by_mtime() {
     // No snapshot leftovers: the private copy is deleted after each read.
     assert!(!snap.join("snapshot.db").exists());
 
-    // Unchanged file: no re-read.
+    // Nothing the snapshot is built from was written: no re-read.
     assert_eq!(reader.refresh(), Refresh::Unchanged);
 
     let _ = fs::remove_dir_all(&storage);
@@ -321,6 +321,110 @@ fn triage_failure_is_tracked_and_hints_stay_generic() {
     let err = reader.last_triage().unwrap();
     assert!(reader.hint(err).contains("--kuro-uid"));
     assert!(!reader.hint(err).contains("000000000"));
+
+    let _ = fs::remove_dir_all(&storage);
+    let _ = fs::remove_dir_all(&snap);
+}
+
+/// Pins that a sidecar which cannot be measured is LOUD once — not once per
+/// tick, and not once ever.
+///
+/// A tick that cannot take its signature keeps its data and carries on,
+/// which is right: nothing is refused, and the condition usually clears by
+/// itself. But a condition that persists then holds the presence at its
+/// last value for the rest of the session, and the warning is the only
+/// thing that tells a reader of the log so. So the warning must exist, and
+/// it must be deduplicated: one line while the fault is still there, and a
+/// fresh one if it clears and returns, because by then the situation has
+/// changed and the earlier line is stale.
+///
+/// What is asserted is both halves of "once". The record (`last_warning`)
+/// says which fault the reader is holding, and the count
+/// (`signature_warnings`) says how many lines it has actually printed —
+/// the count is what a record-only test cannot reach, since the record
+/// reads the same whether the first tick printed or the fifth did. The
+/// lines themselves go to the process's stderr, which a test cannot read,
+/// so the count is kept beside the emission. Lives here rather than in
+/// `tests/` because both accessors are crate-private, next to the triage
+/// dedup case above it.
+#[test]
+fn unmeasurable_sidecar_warns_once_and_again_when_it_returns() {
+    let storage = storage_with_sql("unmeasurable", &[VALID_SCHEMA, UID_ROW, SDK_ROW]);
+    let snap = unique_dir("unmeasurable-snap");
+    let mut reader = DbReader::new(storage.clone(), snap.clone(), None).unwrap();
+
+    assert_eq!(reader.refresh(), Refresh::Updated);
+    assert_eq!(
+        reader.last_warning(),
+        None,
+        "a healthy reader has said nothing"
+    );
+
+    // A sidecar that is there and cannot be read through: a symlink loop,
+    // which the kernel refuses to resolve every time.
+    let wal = storage.join("LocalStorage.db-wal");
+    std::os::unix::fs::symlink("LocalStorage.db-wal", &wal).unwrap();
+    for tick in 1..=5 {
+        assert_eq!(
+            reader.refresh(),
+            Refresh::Unchanged,
+            "tick {tick} is held at the last accepted data"
+        );
+    }
+    assert_eq!(
+        reader.last_warning(),
+        Some("signature"),
+        "a fault that persists is reported, and the record does not change \
+         across the ticks that follow, which is what stops them printing again"
+    );
+    // The count, which is the part a test of the record alone cannot reach:
+    // the record reads the same whether the first tick printed a line or
+    // the fifth did. Without this, dropping the guard would leave every
+    // assertion above passing and the warning would repeat every tick.
+    assert_eq!(
+        reader.signature_warnings(),
+        1,
+        "five blocked ticks, one line: the dedup bounds a persistent fault \
+         to a single warning rather than one per tick"
+    );
+
+    // A healthy tick clears the record, so the fault returning is news.
+    fs::remove_file(&wal).unwrap();
+    let db = storage.join("LocalStorage.db");
+    let later = fs::metadata(&db).unwrap().modified().unwrap() + std::time::Duration::from_secs(60);
+    std::fs::File::options()
+        .write(true)
+        .open(&db)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(later))
+        .unwrap();
+    assert_eq!(
+        reader.refresh(),
+        Refresh::Updated,
+        "a healthy tick triages again"
+    );
+    assert_eq!(
+        reader.last_warning(),
+        None,
+        "a tick with nothing to report clears the record, so a fault that \
+         returns later is a change and not a repeat of the old one"
+    );
+
+    std::os::unix::fs::symlink("LocalStorage.db-wal", &wal).unwrap();
+    assert_eq!(reader.refresh(), Refresh::Unchanged);
+    assert_eq!(
+        reader.last_warning(),
+        Some("signature"),
+        "and the returning fault is reported again rather than swallowed by \
+         the record of the one that was fixed"
+    );
+    assert_eq!(
+        reader.signature_warnings(),
+        2,
+        "and it is a second line, not a silent repeat: a fault that clears and \
+         returns has changed the situation, which is what the record clearing \
+         on a successful tick buys"
+    );
 
     let _ = fs::remove_dir_all(&storage);
     let _ = fs::remove_dir_all(&snap);
