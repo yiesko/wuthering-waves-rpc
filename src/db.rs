@@ -15,11 +15,12 @@
 //! [`MAX_DB_BYTES`] (past [`MAX_JSON_BYTES`] for the launcher cache), caps
 //! the bytes it moves and proves the source did not change mid-copy. Only
 //! the private copy is queried, and it is deleted right after. It is also
-//! opened alone: a sidecar a killed run left beside it is cleared first,
-//! because SQLite reads a leftover journal as a hot one and would
-//! roll its pages back into the copy this tick just made. From the
-//! game's perspective this is indistinguishable from a backup tool: no
-//! SQLite locks are ever taken on the live files.
+//! opened alone: a sidecar a killed run left beside it is cleared first, and
+//! a clear that fails warns instead of ending the tick, because SQLite reads
+//! a leftover journal as a hot one and would roll its pages back into the
+//! copy this tick just made. From the game's perspective this is
+//! indistinguishable from a backup tool: no SQLite locks are ever taken on
+//! the live files.
 //!
 //! The copy mode is the call site's choice, and what it says is what the
 //! destination must not inherit. The per-tick snapshots land in the private
@@ -347,16 +348,19 @@ impl DbReader {
             return self.cached_or_unavailable();
         }
         for (src, snap) in &self.sidecars {
-            // Best effort: without sidecars a torn copy cannot recover. A
-            // sidecar that is missing or past the ceiling is refused before
-            // the destination is opened, and one rewritten mid-copy takes its
-            // copy away again — so what the path holds afterwards is this
-            // tick's or nothing, and anything else there is a leftover from a
-            // killed run. A leftover must not be opened with this tick's
-            // snapshot: a `-journal` is not inert data next to a database,
-            // and SQLite reads it as a hot journal and rolls the pages it
-            // holds back into the copy made a moment ago.
-            Self::remove_quiet(snap);
+            // Best effort: without sidecars a torn copy cannot recover, and a
+            // source that is missing, oversized or rewritten mid-copy is
+            // refused before the destination is opened, so the path holds
+            // this tick's copy or nothing — but only once the leftover a
+            // killed run left has been cleared, which is what the removal
+            // below does first. Skipping it would leave a `-journal` in
+            // place: not inert data beside a database, since SQLite reads
+            // one as a hot journal and rolls the pages it holds back into
+            // the copy made a moment ago. A removal that itself fails is
+            // warned about rather than made fatal — the next tick tries
+            // again, while refusing the snapshot would cost the reader's
+            // data for the whole session.
+            Self::remove_before_copy(snap);
             let _ = bounded_copy(src, snap, MAX_DB_BYTES, DestMode::Overwrite);
         }
 
@@ -588,6 +592,27 @@ impl DbReader {
 
     fn remove_quiet(path: &Path) {
         let _ = fs::remove_file(path);
+    }
+
+    /// Clear a path this tick is about to re-copy, so a leftover from a
+    /// killed run cannot reach the snapshot SQLite opens afterwards.
+    ///
+    /// The counterpart of [`DbReader::remove_quiet`] for the one removal a
+    /// copy cannot make on its own: a refused copy leaves whatever was on
+    /// the path untouched, so a failure here is warned about instead of
+    /// swallowed. It is still not a reason to skip the snapshot — the next
+    /// tick clears the path again, while a snapshot abandoned for the
+    /// session would cost the rich presence this reader exists to publish.
+    /// A path that is already gone is the ordinary case and stays silent.
+    fn remove_before_copy(path: &Path) {
+        if let Err(err) = fs::remove_file(path)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            log::warn(format!(
+                "cannot clear the leftover '{}': {err}; it may still reach the snapshot",
+                path.display()
+            ));
+        }
     }
 
     /// Live display name for one login uid: exact `role_id` match over a private

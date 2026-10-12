@@ -25,7 +25,8 @@
 //! there for the next tick — and a journal is not inert data next to a
 //! database: SQLite reads it as a hot journal and rolls the pages it holds
 //! back into the snapshot. A snapshot copied this tick must therefore never
-//! be opened with a leftover beside it.
+//! be opened with a leftover beside it. Clearing one is best effort: an entry
+//! the tick cannot remove costs it that tick's data, never the session.
 
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -305,6 +306,97 @@ fn test_device_version_replaces_a_stale_copy() {
     assert!(
         !orphan.exists(),
         "the snapshot is removed after the tick that read it"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Pins that a sidecar the tick cannot clear degrades the tick instead of
+/// ending it. The removal is best effort and warns; refusing the snapshot
+/// over one un-clearable file would trade a rare one-tick degradation — which
+/// the next tick retries — for no rich presence at all until the session ends.
+///
+/// The entry stands where a sidecar belongs but is a *directory*: no
+/// `remove_file` can unlink it and no copy can open it, which is the shape
+/// that rare failure takes. It is a `-shm` because SQLite ignores that file
+/// beside a snapshot in rollback-journal mode, so the verdict below is about
+/// the failed clear and nothing else — a `-journal` or a `-wal` planted
+/// instead would fail the read itself.
+#[test]
+fn test_tick_survives_a_sidecar_it_cannot_clear() {
+    let root = fixture("stuck-sidecar");
+    let storage = root.join("Client/Saved/LocalStorage");
+    fs::create_dir_all(&storage).expect("the storage dir is created");
+    let live = storage.join("LocalStorage.db");
+    write_account_db(&live);
+
+    let snap = root.join("snapshots");
+    fs::create_dir_all(&snap).expect("the snapshot dir is created");
+    let stuck = snap.join("snapshot.db-shm");
+    fs::create_dir(&stuck).expect("the un-clearable entry is planted");
+
+    let mut reader = DbReader::new(storage.clone(), snap.clone(), None).expect("the reader opens");
+
+    assert_eq!(
+        reader.refresh(),
+        Refresh::Updated,
+        "a sidecar the tick cannot clear must not cost it the snapshot"
+    );
+    assert_eq!(
+        reader.live_uid(),
+        Some(LIVE_UID),
+        "the tick must still publish the login it just copied"
+    );
+    assert!(
+        stuck.exists(),
+        "the entry outlives the tick that could not remove it"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Pins the other half of that trade — a degraded tick is not a degraded
+/// session. While the un-clearable entry is there SQLite cannot get past it,
+/// taking the directory for a journal it would have to read, and the tick
+/// falls back; once it is gone the next tick copies and triages as if
+/// nothing had happened, with no restart and no operator action. That is what
+/// makes a failed clear worth a warning rather than a refusal.
+#[test]
+fn test_the_next_tick_recovers_from_a_stuck_sidecar() {
+    let root = fixture("stuck-then-gone");
+    let storage = root.join("Client/Saved/LocalStorage");
+    fs::create_dir_all(&storage).expect("the storage dir is created");
+    let live = storage.join("LocalStorage.db");
+    write_account_db(&live);
+
+    let snap = root.join("snapshots");
+    fs::create_dir_all(&snap).expect("the snapshot dir is created");
+    let stuck = snap.join("snapshot.db-journal");
+    fs::create_dir(&stuck).expect("the un-clearable entry is planted");
+
+    let mut reader = DbReader::new(storage.clone(), snap.clone(), None).expect("the reader opens");
+
+    assert_eq!(
+        reader.refresh(),
+        Refresh::Unavailable,
+        "an entry the tick could not clear makes this tick publish nothing"
+    );
+    assert!(
+        reader.last_info().is_none(),
+        "no data read under a leftover must reach the presence payload"
+    );
+
+    fs::remove_dir(&stuck).expect("the entry is gone for the next tick");
+
+    assert_eq!(
+        reader.refresh(),
+        Refresh::Updated,
+        "the tick after the entry is gone must recover on its own"
+    );
+    assert_eq!(
+        reader.live_uid(),
+        Some(LIVE_UID),
+        "the recovered tick publishes the login it just copied"
     );
 
     let _ = fs::remove_dir_all(&root);
