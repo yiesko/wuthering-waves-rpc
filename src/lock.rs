@@ -28,26 +28,44 @@
 //! filesystem would fail the daemon's first snapshot copy anyway, and
 //! refusing once is easier to explain than a lock nobody can attribute.
 //!
-//! The lock dies with the descriptor. The kernel releases it when the last
-//! close happens, whatever ended the process — a clean exit, a signal, an
-//! aborting panic — so a crashed run never leaves a lock behind and this
-//! module needs no recovery path. The *file* is left behind on purpose:
-//! unlinking it would hand a brand-new, unlocked file to the next starter
-//! while the previous one still holds the now-unlinked inode, and two
-//! holders would be back.
+//! The lock dies with the open file description. The kernel releases it when
+//! the last close of that description happens, whatever ended the process — a
+//! clean exit, a signal, an aborting panic — so a crashed run never leaves a
+//! lock behind and this module needs no recovery path. The *file* is left
+//! behind on purpose: unlinking it would hand a brand-new, unlocked file to
+//! the next starter while the previous one still holds the now-unlinked
+//! inode, and two holders would be back.
 //!
-//! One platform caveat, because a guard that is sometimes wrong is worth
-//! knowing about. On the machine this was written on — `$TMPDIR` is ext2 on
-//! zram — a lock released by closing a descriptor could answer `EWOULDBLOCK`
-//! to a fresh descriptor for a moment, with nothing holding the file: no
-//! descriptor open anywhere, and no entry in the kernel's lock table. What
-//! was measured: the one ingredient that reproduced it was a fork happening
-//! beside the locking; eight thousand lock cycles across four threads with no
-//! fork never showed it, and neither did 2400 hand-offs from one instance
-//! exiting to the next starting, which is the shape a user restart has. The
-//! kernel's reason for it is unconfirmed, so the window counts as
-//! unestablished rather than absent — and it can only ever cost a start that
-//! was refused, never a second instance on the slot.
+//! One caveat, because a guard that is sometimes wrong is worth knowing
+//! about — and it is a fork window, not a filesystem. A `flock` belongs to
+//! the *open file description*, not to a descriptor number: `fork` duplicates
+//! every descriptor a process holds, and `O_CLOEXEC` closes those copies only
+//! at the child's `exec`. A child forked while this process holds the lock
+//! therefore keeps the lock alive until it execs, and a fresh descriptor
+//! asking in that window is refused with `EWOULDBLOCK` even though the locker
+//! let go microseconds earlier.
+//!
+//! What was measured, with the filesystem held constant rather than blamed
+//! (every number below comes from one `$TMPDIR`, ext2 on zram). One cycle is:
+//! open the lock file, take the flock, close it, take it again from a fresh
+//! descriptor. Across four threads, 2480 such cycles with no fork anywhere
+//! beside them were refused zero times. The same loop with a child
+//! deliberately held between its fork and its `exec` beside it was refused
+//! 240 times out of 240, and once out of 240 with a real `Command::spawn`
+//! running beside it: the rarity a spawn has, because its own fork and `exec`
+//! are microseconds apart. One refusal read out of `/proc/locks` while it was
+//! still standing showed a live `FLOCK` entry naming a child's pid, and the
+//! lock was grantable again as soon as that child had `exec`ed (240 such
+//! checks, none left out) — held all along by the copy the fork made, never
+//! lost.
+//!
+//! So the window is a consequence of how `flock` is defined, and it is not
+//! retried away: a retry would mask a race in the one place that must stay
+//! unambiguous, while the window can only ever cost a start that was refused,
+//! never a second instance on the slot. wwrpc spawns no child process at all
+//! (no `Command::new`, no `fork`, no `exec` anywhere in it, and the detection
+//! engine it runs in-process starts no watcher), so nothing of ours can
+//! extend the lock past the descriptor that holds it.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, Write};

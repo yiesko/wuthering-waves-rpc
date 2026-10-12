@@ -253,9 +253,12 @@ vs still missing.
   `small_image`: check YOUR app id, exact lowercase key, propagation
   delay, Discord restart.
 * **Second copy won't start** → by design (`flock` on the lock file);
-  diagnostics never take the lock. On some filesystems the kernel refuses a
-  lock for a moment after the previous instance released it, so a start can
-  come back refused once with nothing running — just start it again.
+  diagnostics never take the lock. One narrow case can refuse a start with
+  nothing running: the lock belongs to the open file description, so a child
+  process forked while wwrpc held it keeps it alive until that child `exec`s,
+  and a start landing in that window loses. wwrpc spawns no child processes
+  itself, so a plain restart never reaches that window — if a start is refused
+  with no other instance running, start it again.
 
 # Testing
 

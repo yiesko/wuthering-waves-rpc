@@ -56,14 +56,16 @@ const CHILD_TIMEOUT: Duration = Duration::from_secs(10);
 /// Runs this file's tests one at a time.
 ///
 /// They all take and release locks from one process, and one of them forks a
-/// child that has to be excluded by a lock the parent already holds. With
-/// that fork running beside them, a `flock` can answer `EWOULDBLOCK` for a
-/// file whose holder closed microseconds earlier and which no descriptor
-/// anywhere has open — `/proc/locks` holds no entry for it and the very next
-/// attempt succeeds. That is the platform (the `$TMPDIR` here is ext2 on
-/// zram, which does not implement `flock` itself), not this crate, and it
-/// disappears when the tests stop overlapping. Serialising keeps that out of
-/// the assertions; nothing here depends on the order.
+/// child that has to be excluded by a lock the parent already holds. That
+/// fork is precisely what makes a `flock` answer `EWOULDBLOCK` for a file
+/// whose holder closed microseconds earlier: a lock belongs to the open file
+/// description, `fork` duplicates the descriptor, and `O_CLOEXEC` only closes
+/// that copy at the child's `exec` — so the child keeps the lock alive until
+/// it execs, and a fresh descriptor in that window loses to it. Measured on
+/// this `$TMPDIR` (ext2 on zram) with no fork beside the locking: thousands of
+/// lock cycles, never a refusal, so the filesystem is not the variable.
+/// Serialising keeps the fork from running beside the other tests; nothing
+/// here depends on the order.
 static SERIAL: Mutex<()> = Mutex::new(());
 
 /// Take [`SERIAL`], ignoring the poison a panicking test leaves behind: one
