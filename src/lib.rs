@@ -8,8 +8,7 @@
 
 //! wwrpc library root: detection, LocalStorage reading, Discord IPC and
 //! presence payloads — plus [`run`], the program behind the CLI. The
-//! binary is the shell around it: parse the flags, configure logging,
-//! catch Ctrl+C and turn the outcome into an exit code.
+//! binary is the shell around it.
 //!
 //! # How a tick flows
 //!
@@ -21,33 +20,31 @@
 //!
 //! # Which runs read the game files
 //!
-//! [`needs_game_data`] says whether an invocation is about the game's
-//! files at all; [`run`] decides from that what it actually opens. The
-//! character list is built-in data and a run under `--no-database` reads
-//! nothing, so neither needs an install: a wrong `--game-dir` must not be
-//! able to stop them.
+//! [`needs_game_data`] says whether an invocation is about the game's files
+//! at all, and [`run`] decides from that what it actually opens. The
+//! character list and a `--no-database` run carrying no diagnostic flag read
+//! nothing, so a wrong `--game-dir` must not be able to stop either.
 //!
 //! # Modules
 //!
-//! - [`character`]: `--character` icon keys (names only; art lives in the
-//!   Discord app).
+//! - [`character`]: `--character` icon keys; the art lives in the Discord app.
 //! - [`db`]: copy-to-private-dir `LocalStorage` reader with ordered triage;
 //!   recovers the live identity from launcher-telemetry remnants when the
 //!   level row is missing.
 //! - [`detect`]: rsRPC engine with a WuWa-only database (cache → online →
 //!   stale cache → bundled snapshot).
 //! - [`ipc`]: minimal Discord Unix-socket client (`SET_ACTIVITY`/clear).
-//! - [`lock`]: single-instance guard — one `flock` on `wwrpc.lock`, with the
-//!   pid inside it kept for diagnostics only.
+//! - [`lock`]: single-instance guard — one `flock` on `wwrpc.lock`, its pid
+//!   inside for diagnostics only.
 //! - [`log`]: levelled stderr logging (`--verbose`/`--quiet`, `WWRPC_*`).
-//! - [`presence`]: pure payload builders + the publish-tier decision.
+//! - [`presence`]: pure payload builders and the publish-tier decision.
 //! - [`telemetry_cache`]: the signature-keyed cache behind the launcher
 //!   telemetry lookups — one read per version of the file, misses included,
 //!   and a read that failed retried rather than remembered.
 //! - [`mod@runtime_dir`]: the private runtime directory (0700 dirs, 0600
-//!   files, symlink refusal, RAII temp dirs) that holds the daemon's
-//!   snapshots and instance lock plus the bounded copy that fills it (plain
-//!   files only, byte-capped).
+//!   files, symlink refusal, RAII temp dirs) holding the daemon's snapshots
+//!   and instance lock, plus the bounded copy that fills it (plain files
+//!   only, byte-capped).
 //!
 //! Privacy rule across every module: account values (uids, names, levels)
 //! never reach logs — only shapes (counts, booleans, ages).

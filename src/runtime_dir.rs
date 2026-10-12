@@ -7,28 +7,25 @@
 // (at your option) any later version. See COPYING for details.
 
 //! Private runtime directory: the rules for the temporary paths wwrpc
-//! writes — the snapshot of the game database and its sidecars.
+//! writes — the snapshot of the game database and its sidecars, and the
+//! instance lock.
 //!
-//! [`runtime_dir`] is what applies them, and a path is covered only when its
+//! [`runtime_dir`] applies them, and a path is covered only when its
 //! directory comes from there:
 //!
-//! - Directories are `0700` and files `0600`, enforced after creation so
-//!   even a strange umask cannot widen them.
-//! - `$XDG_RUNTIME_DIR` counts only when it is absolute; empty or relative
-//!   values fall back to the system temp dir with a warning, because shared
-//!   `/tmp` is neither private nor tmpfs. That fallback names the directory
-//!   after the uid (`wwrpc-<uid>`), so one account cannot squat the name
-//!   and lock every other user out of it.
+//! - Directories are `0700` and files `0600`, set after creation because a
+//!   umask can only clear bits, and a strict one would otherwise leave the
+//!   new path unusable.
+//! - `$XDG_RUNTIME_DIR` is honored only when it is absolute and non-empty;
+//!   anything else falls back to the system temp dir with a warning, under
+//!   the name `wwrpc-<uid>`.
 //! - An existing runtime dir is audited: a symlink, a non-directory or a
-//!   directory owned by another user is refused (anyone can pre-create an
-//!   entry in shared `/tmp`), and a directory we own has its `0700` mode
-//!   repaired when it drifted.
-//! - A file that must inherit nothing is created exclusively (`O_EXCL` /
-//!   `create_new`), and no file is ever written through a symlink, so a
-//!   hostile shared temp dir cannot redirect a snapshot elsewhere. A file
-//!   that *must* be replaced — the daemon re-copies it every tick, and
-//!   nothing ever empties the directory it lands in — is truncated in
-//!   place instead; [`DestMode`] is the whole of that decision.
+//!   directory owned by another user is refused, while a directory we own
+//!   has its `0700` mode repaired rather than rejected.
+//! - A file that must inherit nothing is created exclusively, and no file
+//!   is ever written through a symlink; a file that must be replaced is
+//!   truncated in place instead, and [`DestMode`] is the whole of that
+//!   decision.
 //! - [`PrivateTempDir`] is RAII: the directory and its contents are removed
 //!   when the guard is dropped.
 //! - [`bounded_copy`] is the only way a snapshot reaches those files: it
@@ -40,19 +37,16 @@
 //! the daemon's snapshots and its instance lock share one [`runtime_dir`],
 //! and the `--list-accounts` and `--print-activity` scratch directories are
 //! [`PrivateTempDir`]s inside it. A caller must not build a snapshot or
-//! scratch path by hand — the directory rules above are the reason they are
-//! private. The lock file keeps two rules of its own, from
+//! scratch path by hand. The lock file keeps two rules of its own, from
 //! [`SingleInstance::acquire`](crate::lock::SingleInstance::acquire): it is
-//! reused when it already exists rather than refused (refusing it would
-//! hand every later start a lock nothing holds), and it is left behind when
-//! its holder goes.
+//! reused rather than refused when it already exists, and it is left behind
+//! when its holder goes.
 //!
 //! One write is deliberately outside those rules: the detection cache under
 //! `$XDG_CACHE_HOME/wwrpc` (or `~/.cache/wwrpc`) belongs to
-//! [`crate::detect`] and answers to none of them. It is a cache — refilled
-//! from the online database whenever it is missing or stale — so nothing in
-//! it has to be private; auditing that directory means auditing
-//! [`crate::detect`].
+//! [`crate::detect`] and answers to none of them. It is a cache, refilled
+//! from the online database whenever it is missing or stale, so nothing in
+//! it has to be private.
 
 use std::borrow::Cow;
 use std::fs::{self, File, Metadata, OpenOptions};
@@ -87,11 +81,10 @@ const COPY_BUFFER: usize = 64 * 1024;
 /// The wwrpc runtime directory: `<XDG_RUNTIME_DIR>/wwrpc`, or
 /// `<temp_dir>/wwrpc-<uid>` when that variable is unusable.
 ///
-/// The entry is created exclusively and then audited: a symlink, a
-/// non-directory or a directory owned by another user is refused, which is
-/// what makes the shared `/tmp` fallback safe (anyone can pre-create an
-/// entry there). A directory the caller owns is repaired to mode `0700`
-/// when the mode drifted.
+/// A new entry is created exclusively, and an existing one is audited: a
+/// symlink, a non-directory or a directory owned by another user is
+/// refused, while a directory we own is repaired to mode `0700` when the
+/// mode drifted.
 ///
 /// # Errors
 ///
@@ -196,8 +189,7 @@ impl Drop for PrivateTempDir {
 /// exclusively.
 ///
 /// A destination that already exists — a plain file as much as a symlink —
-/// is refused instead of followed or overwritten, so nobody can pre-plant a
-/// link that turns a snapshot write into a write elsewhere.
+/// is refused rather than followed or overwritten.
 ///
 /// # Errors
 ///
@@ -250,41 +242,38 @@ pub enum DestMode {
     Fresh,
     /// Replace the destination — truncate it, creating it when absent —
     /// while still refusing a symlink instead of writing through it.
+    // Truncating in place is safe only because the runtime directory is never
+    // emptied, so a destination this mode is handed is re-copied before the
+    // next reader looks at it. That is a property of the caller that picks
+    // the mode rather than of this code, and it is stated where it is kept
+    // true: the `db` module docs.
     Overwrite,
 }
 
 /// Copy `src` to `dst`, writing at most `limit` bytes and refusing anything
 /// that does not belong in a snapshot.
 ///
-/// The copy is bounded in three places, because a game database is a file
-/// another process keeps writing while we read it:
+/// A game database is a file another process keeps writing while we read it,
+/// so the copy is bounded in three places. Every size and change measurement
+/// describes the handle the bytes came from, never the path, so a source
+/// renamed or replaced mid-copy cannot make the verdict a verdict about
+/// another file.
 ///
-/// - The source is measured first, through the handle the bytes will come
-///   from: over `limit` bytes is refused before the destination is created,
-///   so a runaway file costs nothing.
-/// - The bytes are read through that same handle, in chunks that never read
-///   past `limit` — never with an unbounded `fs::copy`. A source with one
-///   byte too many is refused rather than silently truncated into a corrupt
-///   snapshot.
-/// - It is measured again afterwards: [`signature_unchanged`] must still
-///   hold, or the snapshot mixes an old head with a new tail and is thrown
-///   away.
+/// - The source is measured first, through that handle: over `limit` bytes
+///   is refused before the destination is created.
+/// - The bytes are then read through the same handle, in chunks that never
+///   read past `limit`. A source with one byte too many is refused rather
+///   than silently truncated into a corrupt snapshot.
+/// - It is measured again afterwards, and [`signature_unchanged`] must
+///   still hold or the copy is thrown away: an old head mixed with a new
+///   tail is not a snapshot.
 ///
-/// Both measurements come from the handle, never from the path: a path read
-/// before the open describes a file that may already be a different one. The
-/// source's *kind* is the one thing checked from the path, and that check runs
-/// before the open, because opening a fifo blocks until a writer appears — in
-/// a long-running daemon, a hang rather than an error.
-///
-/// A destination that this call created — or, under [`DestMode::Overwrite`],
-/// truncated — is removed on every failure: a half-written snapshot is
-/// worse than none, because the next reader cannot tell the two apart. The
-/// removal unlinks by path, right after the write handle is dropped, since
-/// safe Rust has no unlink-by-handle; callers of this module write into the
-/// [`runtime_dir`] it keeps at `0700`, so that path names nothing outside
-/// our own snapshot. A destination that already existed and was never
-/// opened is left alone. On success the copy is private (`0600`) whatever
-/// the umask did to it.
+/// A destination this call created — or, under [`DestMode::Overwrite`],
+/// truncated — is removed on every failure; one that already existed and
+/// was never opened is left alone. That removal unlinks by path, since safe
+/// Rust has no unlink-by-handle, so `dst` must name nothing outside the
+/// private [`runtime_dir`] this module keeps at `0700`. On success the copy
+/// is `0600` whatever the umask did to it.
 ///
 /// `src` and `dst` must be different files: under [`DestMode::Overwrite`]
 /// the destination is truncated before the first byte is read, so a file
@@ -349,7 +338,9 @@ pub(crate) fn bounded_copy_inner(
     }
     let mut sink = open_destination(dst, mode)?;
     // From this line on the destination is one this call created or
-    // truncated, so every failure has to take it away again.
+    // truncated, so every failure has to take it away again: a half-written
+    // snapshot is worse than none, because the next reader cannot tell the
+    // two apart.
     let outcome = seal_destination(&sink, dst)
         .and_then(|()| {
             after_measure(src);
@@ -357,6 +348,8 @@ pub(crate) fn bounded_copy_inner(
         })
         .and_then(|()| verify_unchanged(&source, src, &before));
     if let Err(err) = outcome {
+        // The handle goes first: safe Rust has no unlink-by-handle, and the
+        // path below is only safe to unlink once nothing holds the file.
         drop(sink);
         remove_destination(dst);
         return Err(err);

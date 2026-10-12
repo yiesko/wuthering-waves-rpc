@@ -8,14 +8,10 @@
 
 //! Change detection for files wwrpc reads on a poll loop.
 //!
-//! Every answer the poll loop draws from a game file it must copy first —
-//! the launcher telemetry rows behind the player's display name, the
-//! remnants behind a recovered login — has one thing in common: "there is
-//! nothing here" is the ordinary answer, not an exceptional one. The rows
-//! are written at login and deleted once the launcher uploads them, so most
-//! ticks find no name at all. A cache that only remembers hits would
-//! therefore re-read the file on exactly the ticks where there is nothing
-//! new in it, which is the same as never caching anything.
+//! The launcher telemetry rows behind a display name, and the remnants
+//! behind a recovered login, share one property: "there is nothing here" is
+//! their ordinary answer. Rows are written at login and deleted once the
+//! launcher uploads them, so most ticks find no name at all.
 //!
 //! [`TelemetryCache`] keys a lookup on the file it was read from — its
 //! length and its whole modification time, through [`file_signature`] —
@@ -26,15 +22,14 @@
 //! Two limits follow from a signature describing bytes, and both are the
 //! caller's to handle. A read that never completed is not an answer and is
 //! never stored, so a refused copy is tried again rather than frozen
-//! ([`Lookup`]); and an answer reached from something outside the file — the
-//! clock, most of all — is not re-derived either, so a cached one goes on
-//! standing whichever way time moves it.
+//! ([`Lookup`]); and an answer reached from outside the file — the clock,
+//! most of all — is not re-derived either, so a cached one goes on standing
+//! whichever way time moves it.
 //!
-//! The signature describes a file, not a question. A caller whose question
+//! The signature describes a file, not a question: a caller whose question
 //! changes while the file does not — a different account asking for its own
 //! name in telemetry nobody wrote since — must say so with
-//! [`TelemetryCache::clear`], because the cache alone cannot tell the two
-//! lookups apart.
+//! [`TelemetryCache::clear`].
 
 use std::fs;
 use std::io;
@@ -43,17 +38,16 @@ use std::time::SystemTime;
 
 /// One version of one file: how long it is, and when it was last written.
 ///
-/// Two observations of an unchanged file are the same version, which is the
-/// whole of what a lookup cache needs to know. The time is read whole
-/// (seconds plus the nanoseconds the filesystem records), so a rewrite
-/// inside the same second is still a new version wherever the filesystem
-/// keeps that much precision.
+/// Two observations of an unchanged file are the same version. The time is
+/// read whole — seconds plus the nanoseconds the filesystem records — so a
+/// rewrite inside the same second is still a new version wherever the
+/// filesystem keeps that much precision.
 ///
-/// A signature says nothing about the contents: a file rewritten to exactly
-/// the same length at exactly the same time keeps its identity, and a lookup
-/// keyed on one cannot see the difference. Callers that need more than "did
-/// this change" — a database whose rows are deleted without changing its
-/// size, say — must not read one as proof of anything else.
+/// A signature says nothing about the contents. A file rewritten to exactly
+/// the same length at exactly the same time keeps its identity and a lookup
+/// keyed on one cannot see the difference, so a caller that needs more than
+/// "did this change" — a database whose rows are deleted without changing
+/// its size, say — must not read one as proof of anything else.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileSignature {
     mtime: SystemTime,
@@ -91,14 +85,12 @@ pub fn file_signature(path: &Path) -> io::Result<FileSignature> {
 /// What one read of a file produced: whether it happened at all, and the
 /// answer when it did.
 ///
-/// The two are worth separating because only one of them is knowledge. "The
-/// rows hold no such name" and "the rows could not be read" both arrive as a
-/// `None` from a plain [`Option`], and only the first is an answer — while a
+/// Only the answer is knowledge. "The rows hold no such name" and "the rows
+/// could not be read" both arrive as a `None` from a plain [`Option`], and a
 /// signature describes the file's bytes and says nothing about the disk they
-/// sit on. Storing the second under one would freeze a full filesystem, a
-/// busy destination or a permission change until the writer next touched the
-/// file, which for a launcher that mostly does not write is the rest of the
-/// session. [`TelemetryCache`] keeps the first and forgets the second.
+/// sit on — so storing the second would freeze a full filesystem, a busy
+/// destination or a permission change until the writer next touched the
+/// file. [`TelemetryCache`] keeps the first and forgets the second.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Lookup<T> {
     /// The file was never read: nowhere to copy it, a copy that was refused,
@@ -113,26 +105,21 @@ pub enum Lookup<T> {
 /// One cached lookup, kept against the signature of the file it was read
 /// from.
 ///
-/// Empty until the first lookup, which always runs its loader: there is no
-/// signature yet to match. After that the loader runs exactly when the
-/// signature differs from the cached one, and a lookup that found nothing
-/// is cached like any other answer — the file cannot start containing a
-/// name without changing, and re-reading it would cost a copy per tick for
-/// an answer the bytes cannot produce differently.
+/// Empty until the first lookup, which therefore always runs its loader.
+/// After that the loader runs exactly when the signature differs from the
+/// cached one, and a lookup that found nothing is cached like any other
+/// answer — the file cannot start containing a name without changing.
 ///
-/// What the bytes cannot produce differently is the whole of it, and that
-/// limit is the caller's to respect. A lookup that answers from something
-/// outside the file — the clock, most of all — is not re-derived here, so a
-/// cached answer freezes that reading too, in whichever direction time moves
-/// it. The remnant scan in [`crate::db`] is the case that documents it: a
-/// scan judges event age against the clock, and while the signature holds,
-/// both an accepted event keeps being accepted and a rejected one keeps
-/// being rejected. The one reading the cache refuses to freeze is one that
-/// never happened: [`Lookup::Unread`] is not stored at all.
+/// Nothing else is re-derived, and that limit is the caller's to respect. A
+/// lookup that answers from outside the file — the clock, most of all —
+/// freezes that reading too, in whichever direction time moves it: the
+/// remnant scan in [`crate::db`] judges event age against the clock, so
+/// while the signature holds an accepted event keeps being accepted and a
+/// rejected one keeps being rejected. The one reading the cache refuses to
+/// freeze is one that never happened: [`Lookup::Unread`] never enters the
+/// cache.
 ///
-/// The answer is handed back by copy, since the caller usually keeps it: a
-/// display name the reader stores against the login it belongs to, a census
-/// the tick logs.
+/// The answer is handed back by copy, since the caller usually keeps it.
 #[derive(Debug, Clone)]
 pub struct TelemetryCache<T: Clone> {
     value: Option<T>,
@@ -153,17 +140,16 @@ impl<T: Clone> TelemetryCache<T> {
     /// The answer for `signature`, read from `loader` only when the file was
     /// written since the last lookup.
     ///
-    /// The loader runs when `signature` differs from the one the cached
-    /// answer was read at, and not at all while they are the same. Returns
-    /// the cached answer for a signature already seen — `None` included,
-    /// since "no name in there" is an answer, not the absence of one.
+    /// Returns the cached answer for a signature already seen — `None`
+    /// included, since "no name in there" is an answer, not the absence of
+    /// one.
     ///
-    /// A loader that reports [`Lookup::Unread`] stores nothing. The cache
-    /// keeps what it held and stays without a signature, so the next call
-    /// runs the loader again whatever the file looks like — the retry a
-    /// failed read owes. The returned value cannot tell a failed read from a
-    /// cached miss: for this crate's two call sites both mean "no answer on
-    /// this tick", and only the cache needs to know the difference.
+    /// A loader that reports [`Lookup::Unread`] stores nothing and leaves the
+    /// cache exactly as it was: an empty one stays empty, and one already holding
+    /// another signature keeps that entry rather than pinning the refused one.
+    /// Either way the next lookup for that signature runs its loader again — the
+    /// retry a failed read owes. The returned value cannot tell a failed read
+    /// from a cached miss, which is why only the cache needs to tell them apart.
     pub fn get_with(
         &mut self,
         signature: FileSignature,
