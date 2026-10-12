@@ -83,7 +83,7 @@ wwrpc [OPTIONS]
 | Flag | Env | What it does |
 | --- | --- | --- |
 | `--game-dir <DIR>` | — | Game install dir (auto-discovered: Steam, `~/Games`, Twintail data) |
-| `--no-database` | — | Static presence only; zero game-file access |
+| `--no-database` | — | No game-file reads; silence unless `--static-fallback` adds static text (`--list-accounts` still lists the database) |
 | `--static-fallback` | — | Static `Exploring SOL-III` when there is no rich data (default: stay silent) |
 | `--kuro-uid <UID>` | — | Override auto-detected login (prefer `--account-index`) |
 | `--account-index <N>` | — | Pin the Nth stored account (wins over `--kuro-uid`) |

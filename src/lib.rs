@@ -108,7 +108,10 @@ pub struct Args {
     #[arg(long)]
     pub game_dir: Option<String>,
 
-    /// Disable all game-file access; show static presence instead.
+    /// Publish without reading the game's files: static presence with
+    /// `--static-fallback`, silence without it. The one exception is
+    /// `--list-accounts`, which exists to read the account database and does
+    /// so even with this flag.
     #[arg(long)]
     pub no_database: bool,
 

@@ -13,8 +13,9 @@
 //! parse, send). Identical payloads are not resent except as a periodic
 //! heartbeat. Default mode reads Union Level + Region from a private
 //! copy of `LocalStorage.db` (the live game files are never SQLite-opened,
-//! written or chmodded). `--no-database` disables all game-file access —
-//! which is why it needs no game install either; [`wwrpc::needs_game_data`]
+//! written or chmodded). `--no-database` keeps the run off the game's files —
+//! which is why it needs no game install either, except for the one listing
+//! that exists to read the account database; [`wwrpc::needs_game_data`]
 //! says which invocations concern the game's files at all, even when
 //! `--no-database` leaves one of them nothing to read.
 //!
