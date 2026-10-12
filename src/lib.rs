@@ -41,6 +41,9 @@
 //!   pid inside it kept for diagnostics only.
 //! - [`log`]: levelled stderr logging (`--verbose`/`--quiet`, `WWRPC_*`).
 //! - [`presence`]: pure payload builders + the publish-tier decision.
+//! - [`telemetry_cache`]: the signature-keyed cache behind the launcher
+//!   telemetry lookups — one read per version of the file, misses included,
+//!   and a read that failed retried rather than remembered.
 //! - [`mod@runtime_dir`]: the private runtime directory (0700 dirs, 0600
 //!   files, symlink refusal, RAII temp dirs) that holds the daemon's
 //!   snapshots and instance lock plus the bounded copy that fills it (plain
@@ -57,6 +60,7 @@ pub mod lock;
 pub mod log;
 pub mod presence;
 pub mod runtime_dir;
+pub mod telemetry_cache;
 
 #[cfg(test)]
 mod tests;

@@ -43,6 +43,7 @@ use serde_json::Value;
 
 use crate::log;
 use crate::runtime_dir::{DestMode, PrivateTempDir, bounded_copy};
+use crate::telemetry_cache::{FileSignature, Lookup, TelemetryCache, file_signature};
 
 const MAIN_DB: &str = "LocalStorage.db";
 /// Steam AppId, locating the Proton prefix (`compatdata/<id>/...`) for
@@ -168,11 +169,22 @@ pub struct DbReader {
     /// independent of triage outcome. Drives session identity: DATA follows
     /// pinning/validation, but IDENTITY always follows this signal.
     live_uid: Option<String>,
-    /// Display name keyed by the role uid it was resolved for, plus the
-    /// telemetry mtime it was resolved at. Survives telemetry gaps; dies
-    /// on role switch.
+    /// Display name keyed by the role uid it was resolved for. Survives
+    /// telemetry gaps; dies on role switch.
     cached_display: Option<(String, String)>,
-    kd_mtime: Option<SystemTime>,
+    /// What the launcher's telemetry database had for the live login, keyed
+    /// on that file's signature. Both lookups into it are cached here — the
+    /// live rows (see [`TelemetryCache`]) and the deleted-row remnants — and
+    /// a miss is kept like a hit, so an unwritten telemetry file costs no
+    /// copy at all. Dropped with [`DbReader::cached_display`] whenever a new
+    /// login shows up, which no signature could show on its own.
+    telemetry_names: TelemetryCache<String>,
+    /// Deleted-row remnants for the live login, under the same signature:
+    /// the same miss-is-an-answer rule, for the same file. One of those
+    /// answers depends on the clock rather than on the bytes — a freshness
+    /// gate the signature cannot express, and one whose error is bounded
+    /// (see [`DbReader::remnant_role`]).
+    telemetry_remnants: TelemetryCache<(Option<RemnantRole>, RemnantStats)>,
     /// Game version from the last successful device read, independent of
     /// triage outcome: every enrichment complements the others, so a
     /// failed level triage must not take the version down with it.
@@ -219,7 +231,8 @@ impl DbReader {
             game_dir: None,
             live_uid: None,
             cached_display: None,
-            kd_mtime: None,
+            telemetry_names: TelemetryCache::new(),
+            telemetry_remnants: TelemetryCache::new(),
             cached_version: None,
             last_mtime: None,
             last: None,
@@ -312,10 +325,6 @@ impl DbReader {
             };
         }
 
-        // Display-name tracking runs on every tick, on telemetry's own
-        // cadence — independent of the main snapshot cadence below.
-        self.refresh_display_name();
-
         let meta = match fs::metadata(&self.src_db) {
             Ok(meta) if meta.len() <= MAX_DB_BYTES => meta,
             Ok(_) => {
@@ -333,6 +342,21 @@ impl DbReader {
             log::debug("snapshot unchanged since last tick; reusing data");
             return Refresh::Unchanged;
         }
+
+        // Display-name tracking shares the account database's cadence. The
+        // login a name is resolved against lives in that database, so a tick
+        // finding it unchanged has no new login to resolve for — and the
+        // other tick that reaches this line, the one where the timestamp
+        // still matches but no snapshot has been accepted, has nothing to
+        // resolve for either. A rename waits for the next tick that database
+        // does change, which a running game produces on its own. The trade is
+        // deliberate: telemetry rows are written at login and deleted once
+        // uploaded, so re-reading them every tick meant re-copying a file
+        // nobody had written to be told, most of the time, that there was
+        // still no name in it. What the lookup reads is a separate question
+        // with its own answer — the telemetry file's signature (see
+        // `refresh_display_name`).
+        self.refresh_display_name();
 
         // The same destination is re-copied every tick, so whatever a killed
         // run left there is replaced rather than refused; the ceiling is
@@ -392,6 +416,12 @@ impl DbReader {
             log::info("login uid changed; dropping previous session data");
             self.last = None;
             self.cached_display = None;
+            // The telemetry caches go with it: they are keyed on the file
+            // alone, and this login arrived without the file changing, so a
+            // signature that still matches would hand back the previous
+            // account's name and remnant.
+            self.telemetry_names.clear();
+            self.telemetry_remnants.clear();
         }
         if tick_live.is_some() {
             self.live_uid = tick_live;
@@ -418,8 +448,10 @@ impl DbReader {
                 self.last_mtime = Some(mtime);
                 self.last = Some(info);
                 self.last_reported = None;
-                // Resolve display names against the now-fresh login too: the
-                // top-of-tick phase ran before this tick was known.
+                // The login this tick revealed was unknown to the call above,
+                // so resolve the display name once more against it. The
+                // telemetry lookup is keyed on that file's signature: when
+                // nothing was written since, this costs a stat and no copy.
                 self.refresh_display_name();
                 log::debug(format!(
                     "snapshot accepted; quests data: {}, version data: {}",
@@ -461,12 +493,8 @@ impl DbReader {
                         stats.candidates, stats.role_hits, stats.fresh_hits
                     ));
                     if let Some(role) = recovered {
-                        let age_secs = SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .ok()
-                            .and_then(|age| u64::try_from(age.as_millis()).ok())
-                            .map(|now_ms| now_ms.saturating_sub(role.event_ms) / 1000)
-                            .unwrap_or(0);
+                        let age_secs = epoch_millis()
+                            .map_or(0, |now_ms| now_ms.saturating_sub(role.event_ms) / 1000);
                         log::info(format!(
                             "role identity recovered from launcher telemetry (event age {age_secs}s): \
                complemented name+level+region; quests unavailable (no quest row for this login); \
@@ -524,12 +552,28 @@ impl DbReader {
         }
     }
 
-    /// Display-name tracking, independent of the main snapshot cadence.
-    /// Telemetry churns on its own schedule, so this runs every tick, gated
-    /// only on its own mtime: re-resolve when it changed (or never resolved),
-    /// keep the sticky value otherwise. Role switches (see [`DbReader::refresh`])
-    /// already dropped the cache; a re-resolution here always targets the
-    /// current login. Attaches to `last_info` when it lacks a name — explicit
+    /// Display-name tracking: when this runs, and what it re-reads, are two
+    /// separate questions. The call rides the account database's cadence —
+    /// [`DbReader::refresh`] makes it whenever that database is about to be
+    /// read again (its timestamp moved, or no snapshot has been accepted yet)
+    /// and once more if triage takes the copy it just made — while the lookup
+    /// the call performs is gated on the *telemetry* database's own signature.
+    /// Telemetry churns on its own schedule, so the lookup runs whenever that
+    /// file was written since the last time, and is skipped entirely while it
+    /// stands still, whether the answer was a name or the far more common
+    /// "no name in these rows".
+    ///
+    /// A signature says nothing about which login asked, so a login switch
+    /// has to drop the caches itself. [`DbReader::refresh`] is where that
+    /// happens and where it carries weight: it clears them in the branch
+    /// that moves `live_uid` on, and nothing else moves `live_uid` once
+    /// the reader is open. The guard below re-checks that and cannot fire
+    /// while it holds — it is insurance against a future path moving the
+    /// login without the clear riding along, not a second gate on the one
+    /// that exists. A re-resolution here always targets the current login
+    /// either way.
+    ///
+    /// Attaches to `last_info` when it lacks a name — explicit
     /// `--player-name` still wins downstream, and the triage-built data is
     /// never touched. Values never logged.
     fn refresh_display_name(&mut self) {
@@ -542,25 +586,36 @@ impl DbReader {
             .as_ref()
             .is_some_and(|(uid, _)| uid != &live_uid)
         {
+            // Unreachable while `DbReader::refresh` clears the caches in the
+            // branch that moves the login — kept as the cheap backstop for a
+            // future path that does not, because the cost of being wrong here
+            // is another role's name on the presence.
             log::debug("display cache dropped on role switch");
             self.cached_display = None;
+            self.telemetry_names.clear();
+            self.telemetry_remnants.clear();
         }
-        let kd_mtime = self
-            .game_dir
-            .as_ref()
-            .and_then(|dir| kddata_path(dir))
-            .and_then(|path| fs::metadata(&path).and_then(|meta| meta.modified()).ok());
-        if self.cached_display.is_some() && kd_mtime == self.kd_mtime {
-            log::debug("telemetry unchanged; keeping display cache");
-            return;
-        }
-        log::debug("telemetry changed; re-resolving display name");
-        self.kd_mtime = kd_mtime;
-        if let Some(name) = self.live_role_name(&live_uid) {
-            log::debug("display name resolved");
-            self.cached_display = Some((live_uid, name));
-        } else {
-            log::debug("no live display name in telemetry rows; still missing: name");
+        // A telemetry database that is not there is not a version of one:
+        // there is nothing to key a lookup on, and nothing to copy either —
+        // the name stays whatever it already was.
+        if let Some((source, signature)) = self.telemetry_source() {
+            let resolved = {
+                let role_uid = live_uid.as_str();
+                let snap_dir = self.snap_db.parent();
+                self.telemetry_names.get_with(signature, move || {
+                    // Logged from inside the loader, so this line means a
+                    // read really happened rather than a cached answer.
+                    log::debug("telemetry rewritten; reading the live display name");
+                    Self::live_role_name(&source, snap_dir, role_uid)
+                })
+            };
+            match resolved {
+                Some(name) => {
+                    log::debug("live display name known");
+                    self.cached_display = Some((live_uid, name));
+                }
+                None => log::debug("no live display name in telemetry rows; still missing: name"),
+            }
         }
         // Same liveness rule as display_name(): never attribute a name
         // without a matching live login (computed first: separate borrow).
@@ -570,6 +625,17 @@ impl DbReader {
         {
             info.display_name = display;
         }
+    }
+
+    /// The launcher telemetry database and the signature to key a lookup on
+    /// it with. `None` when there is no such file to read: no game dir, a
+    /// layout with no Steam prefix beside it, or the file itself gone. Both
+    /// telemetry lookups key on this one signature, because live rows and
+    /// deleted-row remnants are two readings of the same file.
+    fn telemetry_source(&self) -> Option<(PathBuf, FileSignature)> {
+        let source = kddata_path(self.game_dir.as_deref()?)?;
+        let signature = file_signature(&source).ok()?;
+        Some((source, signature))
     }
 
     /// Best-effort current login uid from a PRIVATE snapshot copy.
@@ -615,41 +681,105 @@ impl DbReader {
         }
     }
 
-    /// Live display name for one login uid: exact `role_id` match over a private
-    /// copy of the launcher telemetry database. Best-effort by construction:
-    /// rows are ephemeral (written at login, deleted after upload), so
-    /// absence is normal and never an error. Follows the same
+    /// Live display name for one login uid: exact `role_id` match over a
+    /// private copy of the launcher telemetry database. Best-effort by
+    /// construction: rows are ephemeral (written at login, deleted after
+    /// upload), so absence is normal and never an error. Follows the same
     /// copy-to-private-snapshot rules as every other game file read, cap
     /// included.
-    fn live_role_name(&self, role_uid: &str) -> Option<String> {
-        let kd_src = kddata_path(self.game_dir.as_ref()?)?;
-        let snap_dir = self.snap_db.parent()?;
+    ///
+    /// [`Lookup::Unread`] wherever the copy did not happen or did not come
+    /// back — nowhere to put it, or a copy that was refused. Only a file
+    /// that was actually read answers, empty or not, so a failure costs the
+    /// next tick another try instead of freezing the name as missing.
+    ///
+    /// Free-standing rather than a method because the caller holds the cache
+    /// it belongs to mutably: what it needs is the source file and a scratch
+    /// directory, nothing more of the reader.
+    fn live_role_name(kd_src: &Path, snap_dir: Option<&Path>, role_uid: &str) -> Lookup<String> {
+        let Some(snap_dir) = snap_dir else {
+            return Lookup::Unread;
+        };
         let snap_copy = snap_dir.join("kdnames.db");
         // Replaced, never obeyed: this lookup owns the path, and the runtime
         // directory is never emptied, so a copy a killed run left behind
         // would otherwise refuse every lookup after it.
-        bounded_copy(&kd_src, &snap_copy, MAX_DB_BYTES, DestMode::Overwrite).ok()?;
+        if bounded_copy(kd_src, &snap_copy, MAX_DB_BYTES, DestMode::Overwrite).is_err() {
+            return Lookup::Unread;
+        }
         let name = query_kd_names(&snap_copy, role_uid);
-        Self::remove_quiet(&snap_copy);
-        name
+        DbReader::remove_quiet(&snap_copy);
+        Lookup::Answered(name)
     }
 
     /// Identity recovery for one login uid from a PRIVATE copy of the
     /// launcher telemetry database, live rows AND deleted-row remnants
-    /// (see [`find_remnant_role`]). Same copy-to-private-snapshot rules and
-    /// size cap as [`DbReader::live_role_name`]; best-effort, values never
-    /// logged.
-    fn remnant_role(&self, role_uid: &str) -> (Option<RemnantRole>, RemnantStats) {
-        let none = (None, RemnantStats::default());
-        let Some(game_dir) = self.game_dir.as_deref() else {
-            return none;
+    /// (see [`find_remnant_role`]). Best-effort, values never logged.
+    ///
+    /// Cached under the same file signature as [`DbReader::live_role_name`],
+    /// for the same reason and with two exceptions worth naming: "no fresh
+    /// event in there" — what an unchanged file says almost every time —
+    /// cannot have a different answer while those bytes stand, so it costs
+    /// one copy per version instead of one per tick.
+    ///
+    /// Freshness in [`find_remnant_role`] is measured against the clock, not
+    /// the file, and the cache does not know that: it freezes the verdict the
+    /// scan reached, in both directions time could have moved it.
+    ///
+    /// The first is the later of the scan's two clock gates, the age check,
+    /// which only ever pushes an event toward stale — a recovery accepted
+    /// while its event was fresh goes on being served, file unchanged or
+    /// not, past the window. Bounded, because nothing is published from here
+    /// that a re-scan would have withdrawn: an accepted recovery sticks in
+    /// `last`, so a scan run past the window would report no fresh event and
+    /// fall through to that same data.
+    ///
+    /// The second is the earlier gate, the skew allowance, which pushes the
+    /// other way: an event dated more than [`REMNANT_SKEW_MS`] ahead of our
+    /// clock is skipped now and would be eligible once the clock reached it.
+    /// A cached *miss* does not follow it there — the scan already ran, and
+    /// its verdict stands, so the event is only picked up if the launcher
+    /// writes the file again. Smaller than the direction above: it needs a
+    /// clock disagreement that outlives the session, on the path that is
+    /// already degraded (a live login with no level row), and it costs a
+    /// recovered identity rather than a wrong one.
+    ///
+    /// Either way the answer is the live login's own most recent event.
+    /// What is given up beyond them is the per-tick census line, which
+    /// prints these numbers from the cache and reads like a scan that just
+    /// ran.
+    fn remnant_role(&mut self, role_uid: &str) -> (Option<RemnantRole>, RemnantStats) {
+        let Some((source, signature)) = self.telemetry_source() else {
+            log::debug("telemetry scan skipped: no telemetry database to read");
+            return (None, RemnantStats::default());
         };
-        let Some(kd_src) = kddata_path(game_dir) else {
-            log::debug("telemetry scan skipped: no telemetry database located");
-            return none;
-        };
-        let Some(snap_dir) = self.snap_db.parent() else {
-            return none;
+        let snap_dir = self.snap_db.parent();
+        self.telemetry_remnants
+            .get_with(signature, move || {
+                Self::scan_remnant_role(&source, snap_dir, role_uid)
+            })
+            .unwrap_or_default()
+    }
+
+    /// Take the private telemetry copy apart in search of a deleted row for
+    /// one login uid. The counterpart of [`DbReader::live_role_name`] for the
+    /// other reading of the same file: the bytes are gone from SQLite's
+    /// tables but still in the pages, so the scan is a byte-level one.
+    ///
+    /// `Unread` when there was nothing to scan — no scratch directory, a copy
+    /// that was refused, unreadable bytes, or no clock to date the events
+    /// against. A scan that ran always answers: the role it found (possibly
+    /// none) together with the census of what it looked at, both kept under
+    /// the file's signature. Neither is worth re-deriving from the same
+    /// bytes; what one of them additionally depends on is the clock (see
+    /// [`DbReader::remnant_role`]).
+    fn scan_remnant_role(
+        kd_src: &Path,
+        snap_dir: Option<&Path>,
+        role_uid: &str,
+    ) -> Lookup<(Option<RemnantRole>, RemnantStats)> {
+        let Some(snap_dir) = snap_dir else {
+            return Lookup::Unread;
         };
         let snap_copy = snap_dir.join("kdremnant.db");
         // Replaced, never obeyed: this scan owns the path, and the runtime
@@ -657,20 +787,16 @@ impl DbReader {
         // would refuse every scan after it. A refusal that still happens (too
         // large, rewritten mid-copy) reads its reason from the error, the way
         // the size check used to report it.
-        if let Err(err) = bounded_copy(&kd_src, &snap_copy, MAX_DB_BYTES, DestMode::Overwrite) {
+        if let Err(err) = bounded_copy(kd_src, &snap_copy, MAX_DB_BYTES, DestMode::Overwrite) {
             log::debug(format!("telemetry scan skipped: copy failed ({err})"));
-            return none;
+            return Lookup::Unread;
         }
         let bytes = fs::read(&snap_copy).ok();
-        Self::remove_quiet(&snap_copy);
-        let now_ms = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .and_then(|age| u64::try_from(age.as_millis()).ok());
-        let (Some(now_ms), Some(bytes)) = (now_ms, bytes) else {
-            return none;
+        DbReader::remove_quiet(&snap_copy);
+        let (Some(bytes), Some(now_ms)) = (bytes, epoch_millis()) else {
+            return Lookup::Unread;
         };
-        find_remnant_role(&bytes, role_uid, now_ms)
+        Lookup::Answered(Some(find_remnant_role(&bytes, role_uid, now_ms)))
     }
 
     /// One-shot account listing for `--list-accounts`: copies the database
@@ -847,6 +973,17 @@ pub(crate) struct RemnantStats {
 pub(crate) const MAX_REMANT_AGE_MS: u64 = 24 * 60 * 60 * 1000;
 const REMNANT_SKEW_MS: u64 = 5 * 60 * 1000;
 const MAX_REMANT_CANDIDATES: usize = 64;
+
+/// Milliseconds since the Unix epoch, or `None` when the clock says
+/// otherwise (a system time before 1970, or one that does not fit). Every
+/// telemetry event is dated against this, so a scan that cannot read it has
+/// no way to tell a fresh event from a stale one.
+fn epoch_millis() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|since| u64::try_from(since.as_millis()).ok())
+}
 
 /// Recover `(name, level, server)` for one login uid from a PRIVATE
 /// copy of the launcher telemetry database — including deleted-row
