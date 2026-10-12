@@ -8,13 +8,30 @@
 
 //! Minimal Discord IPC client (Unix socket): handshake, `SET_ACTIVITY`
 //! and clear. Only what wwrpc needs: no subscriptions, no proxying.
+//!
+//! # What connected means
+//!
+//! [`IpcClient::is_connected`] is the field the publishing loop asks before
+//! it publishes anything, so it is true only while a socket is held that
+//! completed a handshake and whose framing still lines up. A candidate
+//! socket becomes the connection after Discord answers its handshake, never
+//! before, and any frame exchange that fails takes the socket back out: a
+//! reply that cannot be read whole leaves the read cursor in the middle of a
+//! body, so whatever bytes follow are read as a frame header, and the client
+//! can no longer tell a reply from noise.
+//!
+//! Losing a connection costs one presence tick — the loop reconnects on the
+//! next one — so the client fails the connection instead of keeping a
+//! socket it cannot prove works.
 
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::{Value, json};
+
+use crate::log;
 
 const OP_HANDSHAKE: u32 = 0;
 const OP_FRAME: u32 = 1;
@@ -25,6 +42,12 @@ const MAX_REPLY_BYTES: u32 = 1024 * 1024;
 const MAX_IPC_SOCKETS: u8 = 10;
 /// Give up on slow/dead sockets instead of hanging a tick.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// Why a client configured with something other than a number refuses to
+/// look for a socket at all.
+const BAD_APP_ID: &str =
+    "Discord application id is not a number; set --app-id to the numeric id of your Discord app";
+/// What completes the sentence of an error frame that carried no words.
+const UNSAID: &str = "without saying why";
 
 /// One Discord IPC frame: `op` + little-endian length + JSON body.
 pub(crate) fn encode_frame(op: u32, payload: &str) -> Vec<u8> {
@@ -53,54 +76,188 @@ pub(crate) fn socket_paths() -> Vec<PathBuf> {
     paths
 }
 
+/// Connects to one Discord IPC socket and arms the timeouts that every
+/// read and write on it then runs under.
+///
+/// A connected socket is not a usable one: this proves only that something
+/// is listening at `path`, not that it is Discord and not that it answers.
+/// [`handshake`] is what turns the result into a connection, and until it
+/// returns `Ok` the socket belongs to nobody.
+///
+/// Fails when nothing is listening at `path` — the common case, since the
+/// names are probed rather than looked up — and when the timeouts cannot be
+/// armed on a socket that did answer.
+pub fn try_socket(path: &Path) -> io::Result<UnixStream> {
+    let stream = UnixStream::connect(path)?;
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    Ok(stream)
+}
+
+/// Announces `client_id` to Discord and reads the one reply the handshake
+/// owes, leaving `stream` at the first frame that follows it.
+///
+/// The reply is read, not merely written to: a connection that never
+/// answers — a peer that hung up, a socket that stays silent, a read that
+/// runs into its timeout — is an error here, because the caller cannot tell
+/// such a connection from one whose reply arrived half-read, and only the
+/// second leaves the framing out of step with Discord's.
+///
+/// A reply that refuses the handshake — `evt` set to `ERROR`, or an error
+/// code in `data` — fails it here, carrying Discord's own `message` when it
+/// sent one, so an application id Discord will not accept is diagnosed at
+/// the connection instead of surfacing later as a presence that never
+/// arrives. Nothing else is asked of the reply: a shape this code has never
+/// seen still passes, because a check that demanded today's shape would
+/// break every working connection the first time Discord answered
+/// differently.
+///
+/// `client_id` is the numeric id of the Discord application to publish as,
+/// which Discord itself carries as a string inside the frame. A stream
+/// handed in without timeouts blocks until the peer answers; [`try_socket`]
+/// is what arms them.
+pub fn handshake(stream: &mut UnixStream, client_id: u64) -> io::Result<()> {
+    let payload = json!({"v": 1, "client_id": client_id.to_string()});
+    write_frame(stream, OP_HANDSHAKE, &payload.to_string())?;
+    let reply = read_frame(stream)?;
+    match refusal(&reply) {
+        Some(reason) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Discord refused the handshake {reason}"),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Discord's own reason for refusing, when it refused: an error event or an
+/// error code in `data` says so, and the words come from `data.message` or a
+/// top-level `message`.
+///
+/// Every other reply yields `None`, including one in a shape this code has
+/// never seen, and that asymmetry is the contract: a check demanding a
+/// known shape would turn any future answer from Discord into a broken
+/// connection, while this one can only fail on a refusal Discord stated
+/// outright.
+fn refusal(reply: &Value) -> Option<&str> {
+    let named_error = reply.get("evt").and_then(Value::as_str) == Some("ERROR");
+    let carries_code = reply
+        .get("data")
+        .and_then(|data| data.get("code"))
+        .is_some();
+    if !named_error && !carries_code {
+        return None;
+    }
+    Some(
+        reply
+            .get("data")
+            .and_then(|data| data.get("message"))
+            .or_else(|| reply.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or(UNSAID),
+    )
+}
+
 /// Minimal Discord client: one Unix socket, handshake on `connect`,
-/// `SET_ACTIVITY` per tick. Reconnect by dropping and re-`connect`ing;
-/// reply reads are best-effort (a missed reply heals on the next tick).
+/// `SET_ACTIVITY` per tick. The socket it holds is a handshake that
+/// Discord answered; see the module docs.
 pub struct IpcClient {
-    client_id: String,
+    // `None` marks a configured application id that is not a number: no
+    // handshake can announce it, so such a client says so once at
+    // construction and never connects, instead of failing on every tick.
+    client_id: Option<u64>,
     stream: Option<UnixStream>,
     nonce: u64,
 }
 
 impl IpcClient {
-    /// Unconnected client for one Discord application id. No I/O happens
-    /// until [`IpcClient::connect`].
+    /// Unconnected client for one Discord application id. A value that is
+    /// not a number is reported once here and leaves a client that never
+    /// connects; no other I/O happens until [`IpcClient::connect`].
     pub fn new(client_id: impl Into<String>) -> Self {
+        let client_id = client_id.into();
+        let parsed = client_id.trim().parse::<u64>().ok();
+        if parsed.is_none() {
+            log::warn(format!(
+                "Discord application id '{client_id}' is not a number; no presence can be published"
+            ));
+        }
         Self {
-            client_id: client_id.into(),
+            client_id: parsed,
             stream: None,
             nonce: 0,
         }
     }
 
-    /// `true` after a successful `connect`, until `close` or a write error.
+    /// `true` only while the client holds a socket that completed a
+    /// handshake.
+    ///
+    /// [`connect`](Self::connect) promotes a socket after Discord answers
+    /// it, and both [`close`](Self::close) and a frame exchange that fails
+    /// take it back out. One that failed part-way through a reply is not a
+    /// connection, whatever this field says: the read cursor can sit inside
+    /// a body, and the next read would take its header from body bytes. So
+    /// the next tick reconnects instead of reading from it.
     pub fn is_connected(&self) -> bool {
         self.stream.is_some()
     }
 
-    /// Connect to Discord (tries `discord-ipc-0..9`) and handshake.
+    /// Connects to Discord and leaves the client connected, or reports why
+    /// it could not.
+    ///
+    /// Probes `discord-ipc-0..9` under `$XDG_RUNTIME_DIR` and the system
+    /// temp dir in order, and stops at the first candidate that both
+    /// connects ([`try_socket`]) and completes a handshake
+    /// ([`handshake`]). Only that candidate becomes the connection, so
+    /// [`is_connected`](Self::is_connected) is true afterwards only over a
+    /// socket Discord answered.
+    ///
+    /// A candidate that answers the connection but not the handshake is
+    /// dropped and the search moves on, because a Discord that re-exports
+    /// its socket in several places serves only one of them. When the
+    /// candidates are used up the client is left disconnected — including a
+    /// connection that was open before the call, which `connect` replaces
+    /// as a whole — and the error says whether no socket was there at all
+    /// or the last one that was refused.
+    ///
+    /// A publishing loop retries this every tick while Discord is not
+    /// running, so the error names a cause rather than an attempt, and how
+    /// often to repeat it is the caller's decision.
     pub fn connect(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(client_id) = self.client_id else {
+            self.stream = None;
+            return Err(BAD_APP_ID.into());
+        };
+        let mut refused = None;
         for path in socket_paths() {
-            if let Ok(stream) = UnixStream::connect(&path) {
-                stream.set_read_timeout(Some(IO_TIMEOUT))?;
-                stream.set_write_timeout(Some(IO_TIMEOUT))?;
-                self.stream = Some(stream);
-                self.send(
-                    OP_HANDSHAKE,
-                    &json!({"v": 1, "client_id": self.client_id}).to_string(),
-                )?;
-                // Tolerate a missing/slow handshake reply; the next failed write
-                // will surface a dead connection anyway.
-                let _ = self.read_reply();
-                return Ok(());
+            let Ok(mut candidate) = try_socket(&path) else {
+                continue;
+            };
+            match handshake(&mut candidate, client_id) {
+                Ok(()) => {
+                    self.stream = Some(candidate);
+                    return Ok(());
+                }
+                Err(err) => refused = Some((path, err)),
             }
         }
-        Err("no Discord IPC socket found (is Discord running?)".into())
+        self.stream = None;
+        match refused {
+            Some((path, err)) => Err(format!(
+                "Discord did not complete the handshake on {}: {err}",
+                path.display()
+            )
+            .into()),
+            None => Err("no Discord IPC socket found (is Discord running?)".into()),
+        }
     }
 
-    /// Publish an activity for `pid`. Read errors on the reply are ignored:
-    /// presence is re-sent every tick, so a dropped reply is harmless, while
-    /// write errors are returned to trigger a reconnect.
+    /// Publishes `activity` for `pid` and reads the reply it is owed.
+    ///
+    /// Fails when the frame cannot be written or the reply does not arrive
+    /// whole, and in both cases leaves the client disconnected, because a
+    /// socket that lost an exchange is one the next tick must rebuild.
+    /// Calling [`close`](Self::close) afterwards is still right and costs
+    /// nothing.
     pub fn set_activity(
         &mut self,
         pid: u64,
@@ -113,11 +270,17 @@ impl IpcClient {
           "nonce": self.nonce.to_string(),
         });
         self.send(OP_FRAME, &payload.to_string())?;
-        let _ = self.read_reply();
+        self.read_reply()?;
         Ok(())
     }
 
     /// Best-effort clear; never fails the caller.
+    ///
+    /// Publishes an empty activity for `pid`, which is how Discord drops
+    /// the presence that was published for that pid. A socket that fails
+    /// either direction of that exchange is dropped like any other, so the
+    /// next tick reconnects instead of reusing a stream whose framing is out
+    /// of step.
     pub fn clear(&mut self, pid: u64) {
         self.nonce += 1;
         let payload = json!({
@@ -137,40 +300,69 @@ impl IpcClient {
         self.stream = None;
     }
 
-    fn send(&mut self, op: u32, payload: &str) -> std::io::Result<()> {
-        match self.stream.as_mut() {
-            Some(stream) => {
-                stream.write_all(&encode_frame(op, payload))?;
-                stream.flush()
-            }
-            None => Err(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "Discord IPC not connected",
-            )),
+    /// Writes one frame, dropping the socket when the write fails: a peer
+    /// that will not take a frame is gone, and the client must not keep
+    /// calling itself connected to it.
+    fn send(&mut self, op: u32, payload: &str) -> io::Result<()> {
+        let sent = match self.stream.as_mut() {
+            Some(stream) => write_frame(stream, op, payload),
+            None => Err(not_connected()),
+        };
+        if sent.is_err() {
+            self.stream = None;
         }
+        sent
     }
 
-    fn read_reply(&mut self) -> std::io::Result<Value> {
-        let stream = self.stream.as_mut().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "Discord IPC not connected",
-            )
-        })?;
-        let mut header = [0u8; 8];
-        stream.read_exact(&mut header)?;
-        let len = u32::from_le_bytes(header[4..8].try_into().map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "short IPC header")
-        })?);
-        if len > MAX_REPLY_BYTES {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "IPC reply exceeds sanity size",
-            ));
+    /// Reads one reply frame, dropping the socket unless it arrives whole.
+    ///
+    /// A reply that stops mid-body leaves the read cursor inside that body,
+    /// so the next read takes its eight header bytes from body bytes and
+    /// every frame after that is a guess. Only a new connection can undo
+    /// that, so the socket goes out instead of being read again; what the
+    /// client writes is still well-framed — it is the replies it can no
+    /// longer read.
+    fn read_reply(&mut self) -> io::Result<Value> {
+        let reply = match self.stream.as_mut() {
+            Some(stream) => read_frame(stream),
+            None => Err(not_connected()),
+        };
+        if reply.is_err() {
+            self.stream = None;
         }
-        let mut body = vec![0u8; len as usize];
-        stream.read_exact(&mut body)?;
-        serde_json::from_slice(&body)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        reply
     }
+}
+
+/// The error a frame exchange reports when the client holds no socket to
+/// exchange it over.
+fn not_connected() -> io::Error {
+    io::Error::new(io::ErrorKind::NotConnected, "Discord IPC not connected")
+}
+
+/// Writes one frame and flushes it; the socket carries no userspace
+/// buffering, so the flush only reports a failure the write did not.
+fn write_frame(stream: &mut UnixStream, op: u32, payload: &str) -> io::Result<()> {
+    stream.write_all(&encode_frame(op, payload))?;
+    stream.flush()
+}
+
+/// Reads exactly one frame: an 8-byte header and the body it announces.
+fn read_frame(stream: &mut UnixStream) -> io::Result<Value> {
+    let mut header = [0u8; 8];
+    stream.read_exact(&mut header)?;
+    let len = u32::from_le_bytes(
+        header[4..8]
+            .try_into()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "short IPC header"))?,
+    );
+    if len > MAX_REPLY_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "IPC reply exceeds sanity size",
+        ));
+    }
+    let mut body = vec![0u8; len as usize];
+    stream.read_exact(&mut body)?;
+    serde_json::from_slice(&body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }

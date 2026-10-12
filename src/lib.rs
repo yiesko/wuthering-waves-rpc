@@ -524,6 +524,20 @@ fn publish_loop(
     let mut announced_waiting_game = false;
     let mut announced_waiting_discord = false;
     let mut announced_waiting_discord_official = false;
+    // A lost connection is announced like a wait, but the two latches reset
+    // on different evidence: a wait clears when the client connects or a game
+    // session starts, a loss clears when a presence round trip comes back
+    // acknowledged — the only thing in this loop that proves a reply can
+    // still be read whole — and when a game session starts, because a fresh
+    // game is a fresh chance to be told. That latch also gates the
+    // "connected" line below, because a client reconnecting into a loss
+    // nobody has acknowledged is not connected in any sense worth reporting,
+    // and repeating the line every tick would bury the one warning that
+    // matters. The price is one silent recovery per loss episode: the latch
+    // is set by the first failed publish, and the publish that clears it
+    // only runs after the reconnect it silences.
+    let mut announced_lost_discord = false;
+    let mut announced_lost_discord_official = false;
 
     while RUNNING.load(Ordering::SeqCst) {
         let game = match detector.detect() {
@@ -575,6 +589,8 @@ fn publish_loop(
                 log::info(format!("game detected (pid {pid}), starting session"));
             }
             announced_waiting_discord = false;
+            announced_lost_discord = false;
+            announced_lost_discord_official = false;
             session = Some(Session::new(pid));
             official_session = ipc_official.as_ref().map(|_| Session::new(pid));
         }
@@ -592,7 +608,13 @@ fn publish_loop(
         if !ipc.is_connected() {
             match ipc.connect() {
                 Ok(()) => {
-                    log::info("connected to Discord");
+                    // Withheld while a loss is still unacknowledged: the socket is
+                    // up, but no presence round trip has been acknowledged
+                    // since the last one failed, and that is the only proof
+                    // this loop has that a reply can still be read whole.
+                    if !announced_lost_discord {
+                        log::info("connected to Discord");
+                    }
                     announced_waiting_discord = false;
                 }
                 Err(err) => {
@@ -613,7 +635,9 @@ fn publish_loop(
         {
             match official.connect() {
                 Ok(()) => {
-                    log::info("connected to Discord (official slot)");
+                    if !announced_lost_discord_official {
+                        log::info("connected to Discord (official slot)");
+                    }
                     announced_waiting_discord_official = false;
                 }
                 Err(err) => {
@@ -743,9 +767,15 @@ fn publish_loop(
                             session.last_body = Some(body);
                             session.unchanged_streak = 0;
                             session.last_send = Some(Instant::now());
+                            announced_lost_discord_official = false;
                         }
                         Err(_) => {
-                            log::warn("official slot: Discord connection lost, reconnecting...");
+                            if !announced_lost_discord_official {
+                                log::warn(
+                                    "official slot: Discord connection lost, reconnecting...",
+                                );
+                                announced_lost_discord_official = true;
+                            }
                             official.close();
                         }
                     }
@@ -765,9 +795,15 @@ fn publish_loop(
                     active.unchanged_streak = 0;
                     active.last_send = Some(Instant::now());
                     active.silence_cleared = false;
+                    // An acknowledged publish is the proof that ends a loss:
+                    // the socket both wrote and read a whole frame again.
+                    announced_lost_discord = false;
                 }
                 Err(_) => {
-                    log::warn("Discord connection lost, reconnecting...");
+                    if !announced_lost_discord {
+                        log::warn("Discord connection lost, reconnecting...");
+                        announced_lost_discord = true;
+                    }
                     ipc.close();
                 }
             }
