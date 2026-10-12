@@ -27,7 +27,8 @@
 //! - [`detect`]: rsRPC engine with a WuWa-only database (cache → online →
 //!   stale cache → bundled snapshot).
 //! - [`ipc`]: minimal Discord Unix-socket client (`SET_ACTIVITY`/clear).
-//! - [`lock`]: single-instance pid-file guard.
+//! - [`lock`]: single-instance guard — one `flock` on `wwrpc.lock`, with the
+//!   pid inside it kept for diagnostics only.
 //! - [`log`]: levelled stderr logging (`--verbose`/`--quiet`, `WWRPC_*`).
 //! - [`presence`]: pure payload builders + the publish-tier decision.
 //! - [`runtime_dir`]: private runtime directory (0700 dirs, 0600 files,

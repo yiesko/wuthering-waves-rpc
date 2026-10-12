@@ -125,7 +125,8 @@ detect → snapshot + triage + enrichment → publish tier → send (dedup + hea
   game detection own the slot).
 * **Session clock** from process start time; restarts on pid change or
   account switch. Identical payloads are skipped (heartbeat every 12th
-  tick). One instance only (pid-file lock). Ctrl+C clears presence.
+  tick). One instance only (kernel `flock` on a lock file, pid kept for
+  diagnostics). Ctrl+C clears presence.
 
 # Safety
 
@@ -249,8 +250,8 @@ vs still missing.
 * **Icon missing** → payload is fine if `--print-activity` shows
   `small_image`: check YOUR app id, exact lowercase key, propagation
   delay, Discord restart.
-* **Second copy won't start** → by design (pid-file lock); diagnostics
-  never take the lock.
+* **Second copy won't start** → by design (`flock` on the lock file);
+  diagnostics never take the lock.
 
 # Testing
 
