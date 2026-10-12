@@ -31,7 +31,8 @@
 //! - [`log`]: levelled stderr logging (`--verbose`/`--quiet`, `WWRPC_*`).
 //! - [`presence`]: pure payload builders + the publish-tier decision.
 //! - [`runtime_dir`]: private runtime directory (0700 dirs, 0600 files,
-//!   symlink refusal, RAII temp dirs).
+//!   symlink refusal, RAII temp dirs) plus the bounded snapshot copy that
+//!   fills it.
 //!
 //! Privacy rule across every module: account values (uids, names, levels)
 //! never reach logs — only shapes (counts, booleans, ages).

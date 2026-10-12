@@ -255,9 +255,13 @@ pub enum DestMode {
 ///
 /// A destination that this call created — or, under [`DestMode::Overwrite`],
 /// truncated — is removed on every failure: a half-written snapshot is
-/// worse than none, because the next reader cannot tell the two apart. A
-/// destination that already existed and was never opened is left alone. On
-/// success the copy is private (`0600`) whatever the umask did to it.
+/// worse than none, because the next reader cannot tell the two apart. The
+/// removal unlinks by path, right after the write handle is dropped, since
+/// safe Rust has no unlink-by-handle; callers of this module write into the
+/// [`runtime_dir`] it keeps at `0700`, so that path names nothing outside
+/// our own snapshot. A destination that already existed and was never
+/// opened is left alone. On success the copy is private (`0600`) whatever
+/// the umask did to it.
 ///
 /// `src` and `dst` must be different files: under [`DestMode::Overwrite`]
 /// the destination is truncated before the first byte is read, so a file
@@ -265,53 +269,107 @@ pub enum DestMode {
 ///
 /// # Errors
 ///
-/// [`io::ErrorKind::InvalidData`] when the source is over `limit` or
-/// changed while it was copied; [`io::ErrorKind::AlreadyExists`] when
-/// [`DestMode::Fresh`] finds a destination; plus filesystem errors from
-/// measuring, opening, reading or writing either side.
+/// [`io::ErrorKind::InvalidInput`] when the source is not a regular file;
+/// [`io::ErrorKind::InvalidData`] when it is over `limit` or changed while
+/// it was copied; [`io::ErrorKind::AlreadyExists`] when [`DestMode::Fresh`]
+/// finds a destination; plus filesystem errors from measuring, opening,
+/// reading or writing either side.
 pub fn bounded_copy(src: &Path, dst: &Path, limit: u64, mode: DestMode) -> io::Result<()> {
+    // `after_measure` is the no-op below for every real caller. The crate's
+    // own tests pass one that changes the source underneath a live copy:
+    // the only way to reach the two refusals below — and to show the one
+    // case where a changing name must not matter — with no second process
+    // and no sleep between two writes.
+    bounded_copy_inner(src, dst, limit, mode, no_source_change)
+}
+
+/// The hook [`bounded_copy`] passes: measure, copy, notice nothing.
+fn no_source_change(_src: &Path) {}
+
+/// The body of [`bounded_copy`], carrying the test seam.
+///
+/// `after_measure` runs once, after the source has been measured and before
+/// its first byte is read, so a test can change the source underneath a copy
+/// in flight and pin what happens next. Everything else is [`bounded_copy`].
+pub(crate) fn bounded_copy_inner(
+    src: &Path,
+    dst: &Path,
+    limit: u64,
+    mode: DestMode,
+    after_measure: impl FnOnce(&Path),
+) -> io::Result<()> {
+    check_source(src, limit)?;
     let mut source = File::open(src).map_err(|err| {
         io::Error::new(
             err.kind(),
             format!("cannot open '{}': {err}", src.display()),
         )
     })?;
-    // Measured through the handle, not through the path: the limit and the
-    // verdict below then describe the file the bytes actually come from,
-    // whatever happens to the name while the copy runs.
+    // Measured through the handle, not through the path: the verdict below
+    // then describes the file the bytes actually come from, whatever happens
+    // to the name while the copy runs.
     let before = source.metadata().map_err(|err| {
         io::Error::new(
             err.kind(),
             format!("cannot stat '{}': {err}", src.display()),
         )
     })?;
-    if before.len() > limit {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "'{}' is {} bytes, over the {limit}-byte limit",
-                src.display(),
-                before.len()
-            ),
-        ));
-    }
     let mut sink = open_destination(dst, mode)?;
     // From this line on the destination is one this call created or
     // truncated, so every failure has to take it away again.
-    let written = seal_destination(&sink, dst)
-        .and_then(|()| copy_capped(&mut source, &mut sink, src, dst, limit))
+    let outcome = seal_destination(&sink, dst)
+        .and_then(|()| {
+            after_measure(src);
+            copy_capped(&mut source, &mut sink, src, dst, limit)
+        })
         .and_then(|()| verify_unchanged(&source, src, &before));
-    if let Err(err) = written {
+    if let Err(err) = outcome {
+        drop(sink);
         remove_destination(dst);
         return Err(err);
     }
     Ok(())
 }
 
+/// Refuse a source that must not be copied: anything that is not a regular
+/// file, and anything over the caller's byte limit.
+///
+/// Both refusals run before the destination exists, so a refused source costs
+/// nothing — and before the source is *opened*, because opening a fifo blocks
+/// until a writer appears: in a long-running daemon that is a hang, not an
+/// error.
+fn check_source(src: &Path, limit: u64) -> io::Result<()> {
+    let stat = fs::metadata(src).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("cannot stat '{}': {err}", src.display()),
+        )
+    })?;
+    if !stat.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("'{}' is not a regular file", src.display()),
+        ));
+    }
+    if stat.len() > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "'{}' is {} bytes, over the {limit}-byte limit",
+                src.display(),
+                stat.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Whether two observations of the same file agree on what a copy cares
-/// about: its length and its modification time. The time is compared to the
-/// nanosecond, so a rewrite that lands inside the same second is still
-/// seen — [`bounded_copy`] throws the copy away when this returns `false`.
+/// about: its length and its modification time. The time is read whole —
+/// seconds plus the nanoseconds the filesystem records — so a rewrite inside
+/// the same second is still seen wherever the filesystem keeps that much
+/// precision. [`bounded_copy`] throws the copy away when this returns
+/// `false`.
 #[must_use]
 pub fn signature_unchanged(a: &Metadata, b: &Metadata) -> bool {
     a.len() == b.len() && a.mtime() == b.mtime() && a.mtime_nsec() == b.mtime_nsec()

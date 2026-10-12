@@ -427,10 +427,9 @@ fn test_bounded_copy_rejects_oversized() {
         .expect_err("16 bytes over an 8-byte limit must be refused");
 
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-    assert_eq!(
-        err.to_string(),
-        format!("'{}' is 16 bytes, over the 8-byte limit", src.display()),
-        "the source must be measured before anything is created"
+    assert!(
+        err.to_string().contains("over the 8-byte limit"),
+        "the pre-check must name the limit it refused: {err}"
     );
     assert!(
         !dst.exists(),
@@ -593,43 +592,35 @@ fn test_bounded_copy_overwrite_replaces_and_truncates() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Pins that a copy which fails after the destination was opened takes the
-/// destination away again: a half-written snapshot is worse than none,
-/// because the next reader cannot tell the two apart.
+/// Pins that a source that is not a regular file is refused before it is
+/// opened — a fifo would otherwise block in the open until some other
+/// process decided to write to it, which is a hang, not an error — and that
+/// the refusal costs nothing: no destination is ever created. The refusals
+/// that land *after* the destination exists are covered by the crate's unit
+/// tests, which can change a source mid-copy.
 #[test]
-fn test_bounded_copy_removes_destination_on_failure() {
+fn test_bounded_copy_rejects_non_regular_source() {
     let _env = EnvGuard::new();
-    let dir = scratch("cleanup");
-    // A directory opens fine and only fails once the copy reads from it, so
-    // the failure lands after the destination is already ours.
-    let src = dir.join("unreadable.db");
+    let dir = scratch("non-regular");
+    // A directory is the stand-in for a fifo here: both are refused by the
+    // same check, and safe Rust cannot create a fifo to show the hang.
+    let src = dir.join("a-directory.db");
     let dst = dir.join("snap.db");
     std::fs::create_dir(&src).unwrap();
 
     let err = bounded_copy(&src, &dst, 1 << 20, DestMode::Fresh)
-        .expect_err("a source that cannot be read must fail the copy");
+        .expect_err("a source that is not a regular file must be refused");
 
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     assert!(
         err.to_string()
-            .contains(&format!("cannot read from '{}'", src.display())),
-        "the failure must come from the copy loop, after the destination was created: {err}"
+            .contains(&format!("'{}' is not a regular file", src.display())),
+        "the refusal must name what is wrong: {err}"
     );
     assert!(
-        !dst.symlink_metadata().is_ok(),
-        "the failed copy must leave no destination behind"
+        !dst.exists(),
+        "a refused source must not even create the destination"
     );
-
-    // The same holds for a destination this call truncated: its old bytes
-    // are already gone, so a half-written remnant must not survive either.
-    let stale = dir.join("stale.db");
-    std::fs::write(&stale, b"an older snapshot").unwrap();
-    bounded_copy(&src, &stale, 1 << 20, DestMode::Overwrite)
-        .expect_err("the same unreadable source fails an overwrite too");
-    assert!(
-        !stale.symlink_metadata().is_ok(),
-        "a truncated destination must be taken away too"
-    );
-
     let _ = std::fs::remove_dir_all(&dir);
 }
 
