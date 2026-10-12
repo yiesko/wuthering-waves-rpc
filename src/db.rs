@@ -10,36 +10,31 @@
 //!
 //! A tick copies only when something a snapshot is built from was written
 //! since the last one it accepted, and that set is the account database
-//! together with the SQLite sidecars beside it ([`snapshot_signature`]).
-//! The main file alone is not the set: a game running in WAL mode commits
-//! its rows into `-wal` and leaves the main file's timestamp standing
-//! still.
+//! together with the SQLite sidecars beside it ([`snapshot_signature`]). The
+//! main file alone is not the set: a game running in WAL mode commits its
+//! rows into `-wal` and leaves the main file's timestamp standing still.
 //!
-//! Safety model: the live game files
-//! are NEVER opened with SQLite, never written to, never chmodded and
-//! never kept open. Each tick we copy `LocalStorage.db` (+ journal) into a
-//! private snapshot dir through [`bounded_copy`], which refuses a source past
-//! [`MAX_DB_BYTES`] (past [`MAX_JSON_BYTES`] for the launcher cache), caps
-//! the bytes it moves and proves the source did not change mid-copy. Only
-//! the private copy is queried, and it is deleted right after. It is also
-//! opened alone: a sidecar a killed run left beside it is cleared first, and
-//! a clear that fails warns instead of ending the tick, because SQLite reads
-//! a leftover journal as a hot one and would roll its pages back into the
-//! copy this tick just made. From the game's perspective this is
-//! indistinguishable from a backup tool: no SQLite locks are ever taken on
-//! the live files.
+//! Safety model: the live game files are NEVER opened with SQLite, never
+//! written to, never chmodded and never kept open, so no SQLite lock is ever
+//! taken on them. Each tick copies `LocalStorage.db` (plus journal) into a
+//! private snapshot directory through [`bounded_copy`], which refuses a
+//! source past [`MAX_DB_BYTES`] (past [`MAX_JSON_BYTES`] for the launcher
+//! cache), caps the bytes it moves, and proves the source did not change
+//! mid-copy. Only the private copy is queried, and it is deleted right
+//! after.
 //!
-//! The copy mode is the call site's choice, and what it says is what the
-//! destination must not inherit. The per-tick snapshots land in the private
-//! runtime directory, which nothing ever empties, so they are *replaced*: a
-//! run killed mid-copy leaves its file there, and obeying that file would
-//! cost every later run its data. A one-shot listing copies into a
-//! [`PrivateTempDir`] built for that single call and starts from nothing, so
-//! its copies are [`DestMode::Fresh`] — an entry already on the path is
-//! refused rather than adopted, the second line of defence behind a
-//! directory nobody else can write into. A dry run's scratch directory is
-//! just as fresh yet re-copies like a tick does, so the mode follows the
-//! caller's intent, not which directory it picked.
+//! A private copy is also opened alone: a sidecar a killed run left beside
+//! it is cleared first, because SQLite reads a leftover journal as a hot one
+//! and would roll its pages back into the copy this tick just made. A clear
+//! that fails warns and the tick carries on, because refusing the snapshot
+//! would cost the reader its data for the whole session.
+//!
+//! Copy mode follows the caller's intent, not the directory it picked: the
+//! runtime directory is never emptied, so its per-tick copies are
+//! *replaced* ([`DestMode::Overwrite`]), while a one-shot listing copies
+//! into a [`PrivateTempDir`] built for that single call and starts from
+//! nothing, so its copies are [`DestMode::Fresh`] — an entry already on the
+//! path is refused rather than adopted.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -77,9 +72,9 @@ pub const MAX_JSON_BYTES: u64 = 1024 * 1024;
 
 /// How many rows one read of a file written by someone else takes in. A
 /// bound on *count*, applied by stopping at it: a telemetry query stops
-/// there, and a cache builds no more entries than this and skips whatever
-/// is left, because a JSON parser has to consume a whole list to know where
-/// it ends — and an entry past the cap is skipped, not built and discarded.
+/// there, and a cache builds no more entries than this and skips the rest
+/// rather than building and discarding them, because a JSON parser has to
+/// consume a whole list to know where it ends.
 ///
 /// It bounds the role rows a telemetry read looks at and the account rows
 /// the launcher cache hands back. It does **not** bound the account rows
@@ -248,16 +243,17 @@ pub struct DbReader {
     signature_warnings: usize,
 }
 
-/// Why a tick degraded and said so. One line per distinct reason, so the
-/// log can hold what a reader needs: a fault that persists is reported
-/// once, and one that clears is reported again if it returns.
+/// Why a tick degraded and said so. One line per distinct reason: a fault
+/// that persists is reported once, and one that clears is reported again if
+/// it returns.
 ///
-/// A signature failure and a triage failure cannot happen in the same tick
-/// — the first stops the tick before the second is reached — so they are
+/// A signature failure and a triage failure cannot happen in the same tick —
+/// the first stops the tick before the second is reached — so these are
 /// variants rather than a concatenation, and the deduplication is on the
-/// variant. They are not the same condition either, and merging them would
-/// hide one behind the other: a tick whose signature is unmeasurable and a
-/// tick whose triage failed need different answers from whoever is reading.
+/// variant.
+// A tick whose source set cannot be measured and a tick whose triage failed
+// need different answers from whoever reads the log, so collapsing the two
+// into one record would hide one behind the other.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Reported {
     /// A snapshot was taken and rejected by triage.
@@ -725,28 +721,24 @@ impl DbReader {
         }
     }
 
-    /// Display-name tracking: when this runs, and what it re-reads, are two
-    /// separate questions. The call rides the account database's cadence —
-    /// [`DbReader::refresh`] makes it whenever that database is about to be
-    /// read again (its signature moved, or no snapshot has been accepted
-    /// yet) and once more if triage takes the copy it just made — while the
-    /// lookup the call performs is gated on the *telemetry* database's own
-    /// signature. Telemetry churns on its own schedule, so the lookup runs
-    /// whenever that file was written since the last time, and is skipped
-    /// entirely while it stands still, whether the answer was a name or the
-    /// far more common "no name in these rows".
+    /// Display-name tracking, for the live login only. When this runs and
+    /// what it re-reads are two separate questions: the call rides the
+    /// account database's cadence — [`DbReader::refresh`] makes it whenever
+    /// that database is about to be read again (its signature moved, or no
+    /// snapshot has been accepted yet) and once more if triage takes the
+    /// copy it just made — while the lookup itself is gated on the
+    /// *telemetry* database's own signature and skipped entirely while that
+    /// file stands still, whether the answer was a name or the far more
+    /// common "no name in these rows".
     ///
     /// A signature says nothing about which login asked, so a login switch
-    /// has to drop the caches itself. [`DbReader::refresh`] is where that
-    /// happens and where it carries weight: it clears them in the branch
-    /// that moves `live_uid` on, and nothing else moves `live_uid` once
-    /// the reader is open. The guard below re-checks that and cannot fire
-    /// while it holds — it is insurance against a future path moving the
-    /// login without the clear riding along, not a second gate on the one
-    /// that exists. A re-resolution here always targets the current login
-    /// either way.
+    /// has to drop the caches itself; [`DbReader::refresh`] is where that
+    /// happens and nothing else moves `live_uid` once the reader is open.
+    /// The guard below re-checks that and cannot fire while it holds —
+    /// insurance against a future path, not a second gate on the one that
+    /// exists — and a re-resolution here always targets the current login.
     ///
-    /// Attaches to `last_info` when it lacks a name — explicit
+    /// Attaches to `last_info` when it lacks a name; explicit
     /// `--player-name` still wins downstream, and the triage-built data is
     /// never touched. Values never logged.
     fn refresh_display_name(&mut self) {
@@ -838,11 +830,11 @@ impl DbReader {
     ///
     /// The counterpart of [`DbReader::remove_quiet`] for the one removal a
     /// copy cannot make on its own: a refused copy leaves whatever was on
-    /// the path untouched, so a failure here is warned about instead of
+    /// the path untouched, so a failure here is warned about rather than
     /// swallowed. It is still not a reason to skip the snapshot — the next
     /// tick clears the path again, while a snapshot abandoned for the
     /// session would cost the rich presence this reader exists to publish.
-    /// A path that is already gone is the ordinary case and stays silent.
+    /// A path already gone is the ordinary case and stays silent.
     fn remove_before_copy(path: &Path) {
         if let Err(err) = fs::remove_file(path)
             && err.kind() != std::io::ErrorKind::NotFound
@@ -855,11 +847,11 @@ impl DbReader {
     }
 
     /// Live display name for one login uid: exact `role_id` match over a
-    /// private copy of the launcher telemetry database. Best-effort by
-    /// construction: rows are ephemeral (written at login, deleted after
-    /// upload), so absence is normal and never an error. Follows the same
-    /// copy-to-private-snapshot rules as every other game file read, cap
-    /// included.
+    /// private copy of the launcher telemetry database, under the same
+    /// copy-to-private-snapshot rules and byte cap as every other game file
+    /// read. Best-effort by construction: rows are ephemeral (written at
+    /// login, deleted after upload), so absence is normal and never an
+    /// error.
     ///
     /// [`Lookup::Unread`] wherever the copy did not happen or did not come
     /// back — nowhere to put it, or a copy that was refused. Only a file
@@ -867,8 +859,7 @@ impl DbReader {
     /// next tick another try instead of freezing the name as missing.
     ///
     /// Free-standing rather than a method because the caller holds the cache
-    /// it belongs to mutably: what it needs is the source file and a scratch
-    /// directory, nothing more of the reader.
+    /// mutably; it needs the source file and a scratch directory, nothing more.
     fn live_role_name(kd_src: &Path, snap_dir: Option<&Path>, role_uid: &str) -> Lookup<String> {
         let Some(snap_dir) = snap_dir else {
             return Lookup::Unread;
@@ -886,41 +877,34 @@ impl DbReader {
     }
 
     /// Identity recovery for one login uid from a PRIVATE copy of the
-    /// launcher telemetry database, live rows AND deleted-row remnants
-    /// (see [`find_remnant_role`]). Best-effort, values never logged.
+    /// launcher telemetry database, live rows AND deleted-row remnants (see
+    /// [`find_remnant_role`]). Best-effort, values never logged.
     ///
     /// Cached under the same file signature as [`DbReader::live_role_name`],
-    /// for the same reason and with two exceptions worth naming: "no fresh
-    /// event in there" — what an unchanged file says almost every time —
-    /// cannot have a different answer while those bytes stand, so it costs
-    /// one copy per version instead of one per tick.
+    /// so a "no fresh event in there" — what an unchanged file says almost
+    /// every time — costs one copy per version instead of one per tick.
     ///
     /// Freshness in [`find_remnant_role`] is measured against the clock, not
-    /// the file, and the cache does not know that: it freezes the verdict the
-    /// scan reached, in both directions time could have moved it.
+    /// the file, and the cache does not know that: it freezes the verdict
+    /// the scan reached, in both directions time could have moved it.
     ///
-    /// The first is the later of the scan's two clock gates, the age check,
-    /// which only ever pushes an event toward stale — a recovery accepted
-    /// while its event was fresh goes on being served, file unchanged or
-    /// not, past the window. Bounded, because nothing is published from here
-    /// that a re-scan would have withdrawn: an accepted recovery sticks in
-    /// `last`, so a scan run past the window would report no fresh event and
-    /// fall through to that same data.
+    /// The age gate is the later of the scan's two clock gates and only ever
+    /// pushes an event toward stale, so a recovery accepted while its event
+    /// was fresh goes on being served past the window. Bounded, because
+    /// nothing is published from here that a re-scan would have withdrawn:
+    /// an accepted recovery sticks in `last`, so a scan run past the window
+    /// reports no fresh event and falls through to that same data. The
+    /// [`REMNANT_SKEW_MS`] allowance is the earlier gate and pushes the
+    /// other way: an event dated that far ahead of our clock is skipped now
+    /// and a cached *miss* does not follow it when the clock reaches it, so
+    /// it is only picked up if the launcher writes the file again. Smaller
+    /// than the direction above: it needs a clock disagreement that outlives
+    /// the session, on the path already degraded by a missing level row, and
+    /// it costs a recovered identity rather than a wrong one.
     ///
-    /// The second is the earlier gate, the skew allowance, which pushes the
-    /// other way: an event dated more than [`REMNANT_SKEW_MS`] ahead of our
-    /// clock is skipped now and would be eligible once the clock reached it.
-    /// A cached *miss* does not follow it there — the scan already ran, and
-    /// its verdict stands, so the event is only picked up if the launcher
-    /// writes the file again. Smaller than the direction above: it needs a
-    /// clock disagreement that outlives the session, on the path that is
-    /// already degraded (a live login with no level row), and it costs a
-    /// recovered identity rather than a wrong one.
-    ///
-    /// Either way the answer is the live login's own most recent event.
-    /// What is given up beyond them is the per-tick census line, which
-    /// prints these numbers from the cache and reads like a scan that just
-    /// ran.
+    /// Either way the answer is the live login's own most recent event. What
+    /// is given up beyond them is the per-tick census line, which prints
+    /// these numbers from the cache and reads like a scan that just ran.
     fn remnant_role(&mut self, role_uid: &str) -> (Option<RemnantRole>, RemnantStats) {
         let Some((source, signature)) = self.telemetry_source() else {
             log::debug("telemetry scan skipped: no telemetry database to read");
@@ -941,11 +925,10 @@ impl DbReader {
     ///
     /// `Unread` when there was nothing to scan — no scratch directory, a copy
     /// that was refused, unreadable bytes, or no clock to date the events
-    /// against. A scan that ran always answers: the role it found (possibly
-    /// none) together with the census of what it looked at, both kept under
-    /// the file's signature. Neither is worth re-deriving from the same
-    /// bytes; what one of them additionally depends on is the clock (see
-    /// [`DbReader::remnant_role`]).
+    /// against. A scan that ran always answers, with the role it found
+    /// (possibly none) and the census of what it looked at; both are kept
+    /// under the file's signature, and the whole answer depends on the
+    /// clock as well as the bytes (see [`DbReader::remnant_role`]).
     fn scan_remnant_role(
         kd_src: &Path,
         snap_dir: Option<&Path>,
@@ -1085,13 +1068,10 @@ impl DbReader {
 /// contributes nothing rather than failing the call. That contribution can
 /// never be confused with a sidecar that is present but empty.
 ///
-/// The fold is not injective — different file sets can produce the same
-/// value — so a caller must not read equality as proof that nothing was
-/// written. A collision needs both halves to coincide at once, a main
-/// database exactly as many bytes shorter and timestamps that add up to
-/// the very same nanosecond, and it costs one skipped copy until the next
-/// write rather than a wrong answer. Nor does a signature here say anything
-/// a signature anywhere does not: a rewrite leaving a file's length and
+/// Equality is not proof that nothing was written: the fold is not
+/// injective, and a collision costs one skipped copy until the next write
+/// rather than a wrong answer. Nor does a signature here say anything a
+/// signature anywhere does not — a rewrite leaving a file's length and
 /// modification time exactly where they were is not a change.
 ///
 /// # Errors
@@ -1515,14 +1495,12 @@ pub(crate) fn kddata_path(anywhere: &Path) -> Option<PathBuf> {
 /// a listing needs, and nothing else.
 ///
 /// The launcher keeps an e-mail address, a token and verification codes in
-/// the same object, and none of them has a field here. That is the whole
-/// reason this is a struct and not a tree of untyped values: a JSON parser
-/// skips a key it is not asked for without building a value for it, so a
-/// secret this program never asked for has nothing to log, cache or leak —
-/// it is never turned into a value at all.
+/// the same object, and none of them has a field here. A JSON parser skips
+/// a key it is not asked for without building a value for it, so a secret
+/// this program never asked for is never turned into a value at all.
 ///
 /// Both fields are optional because both are independent in the file: an
-/// account may carry a uid and no nickname. Both are also bounded (see
+/// account may carry a uid and no nickname. Both are bounded (see
 /// [`MAX_CUID_CHARS`] and [`MAX_NAME_CHARS`]), and a value past its cap
 /// arrives as [`None`] rather than as a shortened one.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1613,16 +1591,15 @@ impl LauncherCache {
 /// Read the launcher account cache at `path`: one bounded read, one parse,
 /// and the two answers a listing needs out of the whole file.
 ///
-/// The byte ceiling is enforced on the read itself rather than left to
-/// whoever copies the file, because this function takes whatever path a
-/// caller hands it: the read stops one byte past [`MAX_JSON_BYTES`], so an
-/// oversized file is refused without ever being held whole and without
-/// trusting the size the filesystem reports. A file that is not there, and
-/// bytes that are not JSON, are refused the same way — never half-read,
-/// because a listing prints what it found and half a cache is not what it
-/// found. Every value that does come back is bounded: at most
-/// [`MAX_ROWS`] accounts, at most [`MAX_NAME_CHARS`] characters of nickname,
-/// at most [`MAX_CUID_CHARS`] of cuid.
+/// This takes whatever path a caller hands it, so the byte ceiling is
+/// enforced on the read itself rather than left to whoever copies the file:
+/// the read stops one byte past [`MAX_JSON_BYTES`], refusing an oversized
+/// file without ever holding it whole and without trusting the size the
+/// filesystem reports. A file that is not there, and bytes that are not
+/// JSON, are refused the same way — never half-read. Every value that does
+/// come back is bounded: at most [`MAX_ROWS`] accounts, at most
+/// [`MAX_NAME_CHARS`] characters of nickname, at most [`MAX_CUID_CHARS`] of
+/// cuid.
 ///
 /// # Errors
 ///
@@ -2353,8 +2330,17 @@ pub(crate) fn parse_sdk_accounts(body: &str) -> Option<Vec<SdkAccount>> {
     Some(accounts)
 }
 
-/// Valid `(region, level)` pairs of `SdkLevelData`, without uids, for
-/// display purposes such as `--list-accounts`.
+/// The `(region, level)` pair of every account row of `SdkLevelData`, in
+/// file order and without uids.
+///
+/// Rows this program cannot make sense of are skipped rather than failing
+/// the whole parse, and `None` means the body is not an account map at
+/// all.
+///
+/// This is `parse_sdk_accounts` with the uid dropped, for a caller that
+/// needs a region and a level and never the uid. A `--list-accounts`
+/// listing builds `StoredAccount` rows of its own from that same parse
+/// rather than from this.
 ///
 /// # Examples
 ///
