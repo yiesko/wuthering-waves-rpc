@@ -14,12 +14,15 @@
 //! and `XDG_RUNTIME_DIR` decides which directory the whole module uses.
 
 use std::ffi::OsString;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-use wwrpc::runtime_dir::{PrivateTempDir, create_private_file, runtime_dir};
+use wwrpc::runtime_dir::{
+    DestMode, PrivateTempDir, bounded_copy, create_private_file, runtime_dir, signature_unchanged,
+};
 
 /// Environment variable this file manipulates to pick the runtime base.
 const XDG: &str = "XDG_RUNTIME_DIR";
@@ -106,6 +109,16 @@ fn mode_of(path: &Path) -> u32 {
         .unwrap_or_else(|err| panic!("stat '{}': {err}", path.display()))
         .mode()
         & 0o777
+}
+
+/// Empty scratch directory for one copy test. The caller must hold an
+/// [`EnvGuard`]: [`fixture`] reads `TMPDIR`, which the other tests of this
+/// file mutate while they run.
+fn scratch(tag: &str) -> PathBuf {
+    let dir = fixture(tag);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("the scratch dir is created");
+    dir
 }
 
 /// Pins that an absolute, valid `XDG_RUNTIME_DIR` yields
@@ -343,17 +356,309 @@ fn test_runtime_dir_repairs_mode_drift() {
 }
 
 /// Pins that a missing base — a `XDG_RUNTIME_DIR` left over from a login
-/// manager that is gone — is rebuilt instead of becoming a hard failure.
+/// manager that is gone — is rebuilt instead of becoming a hard failure,
+/// and that every missing level is rebuilt, not just the last one.
 #[test]
 fn test_runtime_dir_rebuilds_missing_base() {
     let env = EnvGuard::new();
-    let base = fixture("stale");
-    let _ = std::fs::remove_dir_all(&base);
+    // Two levels below the fixture: `create_dir_all` has to walk the whole
+    // tree, not stop at the first missing component.
+    let root = fixture("stale");
+    let base = root.join("missing").join("root");
+    let _ = std::fs::remove_dir_all(&root);
     env.set(XDG, base.to_str().expect("temp dir is utf-8"));
 
     let dir = runtime_dir().expect("a missing base is rebuilt");
 
     assert_eq!(dir, base.join("wwrpc"));
+    assert!(
+        base.is_dir(),
+        "every missing level of the base must be rebuilt"
+    );
     assert_eq!(mode_of(&dir), 0o700, "the rebuilt dir is owner-only");
-    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Pins that a valid `XDG_RUNTIME_DIR` keeps the plain `wwrpc` entry name
+/// even when it points at the shared temp dir: honoring the operator's
+/// value is the spec, so only the fallback — a base we picked ourselves —
+/// carries the `wwrpc-<uid>` suffix that keeps accounts apart.
+#[test]
+fn test_runtime_dir_xdg_base_keeps_plain_name_at_temp_dir() {
+    let env = EnvGuard::new();
+    // Sandbox the fallback: the test must never touch the real `/tmp`.
+    let sandbox = fixture("xdg-temp");
+    let _ = std::fs::remove_dir_all(&sandbox);
+    std::fs::create_dir_all(&sandbox).unwrap();
+    env.set(TMPDIR, sandbox.to_str().expect("temp dir is utf-8"));
+    // Point XDG at exactly what the fallback would have used, so the two
+    // paths differ only in how they were reached.
+    let base = std::env::temp_dir();
+    env.set(XDG, base.to_str().expect("temp dir is utf-8"));
+
+    let dir = runtime_dir().expect("a valid XDG base is honored, wherever it points");
+
+    assert_eq!(
+        dir,
+        base.join("wwrpc"),
+        "a configured base must keep the plain name whatever directory it is"
+    );
+    assert_eq!(
+        dir.file_name().and_then(|name| name.to_str()),
+        Some("wwrpc"),
+        "the uid suffix belongs to the fallback alone, never to a configured base"
+    );
+
+    let _ = std::fs::remove_dir_all(&sandbox);
+}
+
+/// Pins that a source over the caller's byte limit is refused before the
+/// destination is ever created: an oversized file must cost nothing, and
+/// leave nothing behind.
+#[test]
+fn test_bounded_copy_rejects_oversized() {
+    let _env = EnvGuard::new();
+    let dir = scratch("oversized");
+    let src = dir.join("big.db");
+    let dst = dir.join("snap.db");
+    std::fs::write(&src, b"0123456789abcdef").unwrap();
+
+    let err = bounded_copy(&src, &dst, 8, DestMode::Fresh)
+        .expect_err("16 bytes over an 8-byte limit must be refused");
+
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        err.to_string(),
+        format!("'{}' is 16 bytes, over the 8-byte limit", src.display()),
+        "the source must be measured before anything is created"
+    );
+    assert!(
+        !dst.exists(),
+        "an oversized source must not even create the destination"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Pins that a source of exactly `limit` bytes is copied: the cap refuses
+/// one byte more, never the boundary itself.
+#[test]
+fn test_bounded_copy_accepts_exactly_at_limit() {
+    let _env = EnvGuard::new();
+    let dir = scratch("exact");
+    let src = dir.join("exact.db");
+    let dst = dir.join("snap.db");
+    std::fs::write(&src, b"0123456789abcdef").unwrap();
+
+    bounded_copy(&src, &dst, 16, DestMode::Fresh).expect("16 bytes fit a 16-byte limit");
+
+    assert_eq!(std::fs::read(&dst).unwrap(), b"0123456789abcdef");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Pins the happy path: the bytes land verbatim and the destination is
+/// private (`0600`), whatever the umask did to the requested mode.
+#[test]
+fn test_bounded_copy_happy_path() {
+    let _env = EnvGuard::new();
+    let dir = scratch("happy");
+    let src = dir.join("src.db");
+    let dst = dir.join("snap.db");
+    let payload: Vec<u8> = (0..=255u8).cycle().take(300_000).collect();
+    std::fs::write(&src, &payload).unwrap();
+
+    bounded_copy(&src, &dst, 1 << 20, DestMode::Fresh).expect("a small source is copied");
+
+    assert_eq!(
+        std::fs::read(&dst).unwrap(),
+        payload,
+        "the bytes must land verbatim"
+    );
+    assert_eq!(mode_of(&dst), 0o600, "a snapshot must be owner-only");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Pins that [`DestMode::Fresh`] refuses an existing destination instead of
+/// clobbering it, and that the refused copy leaves the old bytes alone.
+#[test]
+fn test_bounded_copy_fresh_refuses_existing_dst() {
+    let _env = EnvGuard::new();
+    let dir = scratch("fresh");
+    let src = dir.join("src.db");
+    let dst = dir.join("snap.db");
+    std::fs::write(&src, b"new").unwrap();
+    std::fs::write(&dst, b"keep").unwrap();
+
+    let err = bounded_copy(&src, &dst, 1 << 20, DestMode::Fresh)
+        .expect_err("an existing destination must be refused");
+
+    assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+    assert_eq!(
+        std::fs::read(&dst).unwrap(),
+        b"keep",
+        "the refused copy must leave the previous bytes in place"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Pins that [`DestMode::Fresh`] refuses a pre-planted symlink instead of
+/// writing through it.
+#[test]
+fn test_bounded_copy_fresh_refuses_symlink() {
+    let _env = EnvGuard::new();
+    let dir = scratch("fresh-link");
+    let src = dir.join("src.db");
+    let target = dir.join("secret.db");
+    let dst = dir.join("snap.db");
+    std::fs::write(&src, b"payload").unwrap();
+    std::fs::write(&target, b"secret").unwrap();
+    std::os::unix::fs::symlink(&target, &dst).unwrap();
+
+    let err = bounded_copy(&src, &dst, 1 << 20, DestMode::Fresh)
+        .expect_err("a planted symlink must be refused");
+
+    assert_eq!(
+        err.kind(),
+        io::ErrorKind::AlreadyExists,
+        "the exclusive create is what refuses the link"
+    );
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        b"secret",
+        "the symlink target must stay untouched"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Pins that [`DestMode::Overwrite`] still refuses a pre-planted symlink:
+/// truncating through a link would redirect the whole snapshot elsewhere.
+#[test]
+fn test_bounded_copy_overwrite_refuses_symlink() {
+    let _env = EnvGuard::new();
+    let dir = scratch("overwrite-link");
+    let src = dir.join("src.db");
+    let target = dir.join("secret.db");
+    let dst = dir.join("snap.db");
+    std::fs::write(&src, b"payload").unwrap();
+    std::fs::write(&target, b"secret").unwrap();
+    std::os::unix::fs::symlink(&target, &dst).unwrap();
+
+    bounded_copy(&src, &dst, 1 << 20, DestMode::Overwrite)
+        .expect_err("overwrite must refuse a symlink too");
+
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        b"secret",
+        "the symlink target must stay untouched"
+    );
+    assert!(
+        dst.symlink_metadata()
+            .is_ok_and(|meta| meta.file_type().is_symlink()),
+        "the refused destination must still be the link that was planted"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Pins that [`DestMode::Overwrite`] replaces the destination completely: a
+/// shorter new copy leaves no stale tail, a missing destination is created,
+/// and the result is private like any other snapshot.
+#[test]
+fn test_bounded_copy_overwrite_replaces_and_truncates() {
+    let _env = EnvGuard::new();
+    let dir = scratch("overwrite");
+    let src = dir.join("src.db");
+    let dst = dir.join("snap.db");
+    std::fs::write(&src, b"new").unwrap();
+    std::fs::write(&dst, b"a much longer previous snapshot").unwrap();
+    std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    bounded_copy(&src, &dst, 1 << 20, DestMode::Overwrite)
+        .expect("an existing snapshot is replaced");
+
+    assert_eq!(
+        std::fs::read(&dst).unwrap(),
+        b"new",
+        "the destination must be truncated to exactly the new bytes"
+    );
+    assert_eq!(
+        mode_of(&dst),
+        0o600,
+        "a replaced snapshot must be private again"
+    );
+
+    let absent = dir.join("absent.db");
+    bounded_copy(&src, &absent, 1 << 20, DestMode::Overwrite)
+        .expect("overwrite creates a destination that is not there yet");
+    assert_eq!(std::fs::read(&absent).unwrap(), b"new");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Pins that a copy which fails after the destination was opened takes the
+/// destination away again: a half-written snapshot is worse than none,
+/// because the next reader cannot tell the two apart.
+#[test]
+fn test_bounded_copy_removes_destination_on_failure() {
+    let _env = EnvGuard::new();
+    let dir = scratch("cleanup");
+    // A directory opens fine and only fails once the copy reads from it, so
+    // the failure lands after the destination is already ours.
+    let src = dir.join("unreadable.db");
+    let dst = dir.join("snap.db");
+    std::fs::create_dir(&src).unwrap();
+
+    let err = bounded_copy(&src, &dst, 1 << 20, DestMode::Fresh)
+        .expect_err("a source that cannot be read must fail the copy");
+
+    assert!(
+        err.to_string()
+            .contains(&format!("cannot read from '{}'", src.display())),
+        "the failure must come from the copy loop, after the destination was created: {err}"
+    );
+    assert!(
+        !dst.symlink_metadata().is_ok(),
+        "the failed copy must leave no destination behind"
+    );
+
+    // The same holds for a destination this call truncated: its old bytes
+    // are already gone, so a half-written remnant must not survive either.
+    let stale = dir.join("stale.db");
+    std::fs::write(&stale, b"an older snapshot").unwrap();
+    bounded_copy(&src, &stale, 1 << 20, DestMode::Overwrite)
+        .expect_err("the same unreadable source fails an overwrite too");
+    assert!(
+        !stale.symlink_metadata().is_ok(),
+        "a truncated destination must be taken away too"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Pins that [`signature_unchanged`] sees an idle file as unchanged and a
+/// grown one as changed: that verdict is what re-checks the source after
+/// the bytes were written.
+#[test]
+fn test_signature_unchanged_detects_change() {
+    let _env = EnvGuard::new();
+    let dir = scratch("signature");
+    let path = dir.join("game.db");
+    std::fs::write(&path, b"first").unwrap();
+
+    let before = std::fs::metadata(&path).unwrap();
+    assert!(
+        signature_unchanged(&before, &std::fs::metadata(&path).unwrap()),
+        "an idle file must compare equal to itself"
+    );
+
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("the source is appendable")
+        .write_all(b"-second")
+        .unwrap();
+    assert!(
+        !signature_unchanged(&before, &std::fs::metadata(&path).unwrap()),
+        "an appended file must be seen as changed"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

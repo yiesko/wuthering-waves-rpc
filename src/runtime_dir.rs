@@ -30,13 +30,17 @@
 //!   shared temp dir cannot redirect a snapshot elsewhere.
 //! - [`PrivateTempDir`] is RAII: the directory and its contents are removed
 //!   when the guard is dropped.
+//! - [`bounded_copy`] is the only way a snapshot reaches those files: it
+//!   refuses a source over the caller's byte limit, writes at most that
+//!   many bytes, proves the source did not change under it, and takes the
+//!   destination away again whenever it cannot finish.
 //!
 //! Creating a temp path is this module's job alone: callers must not build
 //! private paths on their own.
 
 use std::borrow::Cow;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::fs::{self, File, Metadata, OpenOptions};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -59,6 +63,10 @@ const XDG_RUNTIME_DIR: &str = "XDG_RUNTIME_DIR";
 /// collisions end on the first try; the budget only bounds a pathological
 /// (or hostile) runtime dir.
 const NAME_ATTEMPTS: u32 = 64;
+
+/// Bytes per read while a snapshot is copied: a page multiple that keeps a
+/// 64 MiB database at about a thousand syscalls.
+const COPY_BUFFER: usize = 64 * 1024;
 
 /// The wwrpc runtime directory: `<XDG_RUNTIME_DIR>/wwrpc`, or
 /// `<temp_dir>/wwrpc-<uid>` when that variable is unusable.
@@ -217,6 +225,98 @@ pub fn create_private_file(path: &Path, contents: &[u8]) -> io::Result<()> {
         })
 }
 
+/// What [`bounded_copy`] does with a destination that already exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DestMode {
+    /// Refuse the copy unless the destination is absent, and create it
+    /// exclusively (`O_EXCL`): a snapshot that must inherit nothing, a
+    /// planted file or link included.
+    Fresh,
+    /// Replace the destination — truncate it, creating it when absent —
+    /// while still refusing a symlink instead of writing through it.
+    Overwrite,
+}
+
+/// Copy `src` to `dst`, writing at most `limit` bytes and refusing anything
+/// that does not belong in a snapshot.
+///
+/// The copy is bounded in three places, because a game database is a file
+/// another process keeps writing while we read it:
+///
+/// - The source is measured first: over `limit` bytes is refused before
+///   the destination is created, so a runaway file costs nothing.
+/// - The bytes are read through a handle already held, in chunks that never
+///   read past `limit` — never with an unbounded `fs::copy`. A source with
+///   one byte too many is refused rather than silently truncated into a
+///   corrupt snapshot.
+/// - That same handle is measured again afterwards: [`signature_unchanged`]
+///   must still hold, or the snapshot mixes an old head with a new tail and
+///   is thrown away.
+///
+/// A destination that this call created — or, under [`DestMode::Overwrite`],
+/// truncated — is removed on every failure: a half-written snapshot is
+/// worse than none, because the next reader cannot tell the two apart. A
+/// destination that already existed and was never opened is left alone. On
+/// success the copy is private (`0600`) whatever the umask did to it.
+///
+/// `src` and `dst` must be different files: under [`DestMode::Overwrite`]
+/// the destination is truncated before the first byte is read, so a file
+/// copied onto itself would destroy the source.
+///
+/// # Errors
+///
+/// [`io::ErrorKind::InvalidData`] when the source is over `limit` or
+/// changed while it was copied; [`io::ErrorKind::AlreadyExists`] when
+/// [`DestMode::Fresh`] finds a destination; plus filesystem errors from
+/// measuring, opening, reading or writing either side.
+pub fn bounded_copy(src: &Path, dst: &Path, limit: u64, mode: DestMode) -> io::Result<()> {
+    let mut source = File::open(src).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("cannot open '{}': {err}", src.display()),
+        )
+    })?;
+    // Measured through the handle, not through the path: the limit and the
+    // verdict below then describe the file the bytes actually come from,
+    // whatever happens to the name while the copy runs.
+    let before = source.metadata().map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("cannot stat '{}': {err}", src.display()),
+        )
+    })?;
+    if before.len() > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "'{}' is {} bytes, over the {limit}-byte limit",
+                src.display(),
+                before.len()
+            ),
+        ));
+    }
+    let mut sink = open_destination(dst, mode)?;
+    // From this line on the destination is one this call created or
+    // truncated, so every failure has to take it away again.
+    let written = seal_destination(&sink, dst)
+        .and_then(|()| copy_capped(&mut source, &mut sink, src, dst, limit))
+        .and_then(|()| verify_unchanged(&source, src, &before));
+    if let Err(err) = written {
+        remove_destination(dst);
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Whether two observations of the same file agree on what a copy cares
+/// about: its length and its modification time. The time is compared to the
+/// nanosecond, so a rewrite that lands inside the same second is still
+/// seen — [`bounded_copy`] throws the copy away when this returns `false`.
+#[must_use]
+pub fn signature_unchanged(a: &Metadata, b: &Metadata) -> bool {
+    a.len() == b.len() && a.mtime() == b.mtime() && a.mtime_nsec() == b.mtime_nsec()
+}
+
 /// Where the runtime directory lives, and how much of that base is trusted.
 enum RuntimeBase {
     /// `$XDG_RUNTIME_DIR`, absolute and non-empty: the spec's per-user
@@ -332,6 +432,157 @@ fn create_private_dir(path: &Path) -> io::Result<()> {
         })?;
     // mkdir's mode is masked by the umask; enforce the exact value.
     set_mode(path, DIR_MODE)
+}
+
+/// Open the destination for writing without ever following a symlink.
+///
+/// [`DestMode::Fresh`] creates it exclusively, so anything already there —
+/// a file, a link, a directory — is refused by the kernel itself.
+/// [`DestMode::Overwrite`] truncates, creating it when absent, with
+/// `O_NOFOLLOW`: a link planted where the snapshot goes must not redirect
+/// the whole copy somewhere else, and the check cannot race the way a
+/// separate `lstat` would. Both ask for [`FILE_MODE`], which
+/// [`seal_destination`] then pins exactly.
+fn open_destination(dst: &Path, mode: DestMode) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).mode(FILE_MODE);
+    match mode {
+        DestMode::Fresh => {
+            options.create_new(true);
+        }
+        DestMode::Overwrite => {
+            options.create(true).truncate(true);
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+    }
+    options.open(dst).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("cannot open '{}': {err}", dst.display()),
+        )
+    })
+}
+
+/// Pin the destination to [`FILE_MODE`] through the handle being written,
+/// not through the path, so a path swapped after the open cannot redirect
+/// the `chmod`. Called before the first byte lands: the umask can only
+/// clear bits, so a snapshot is never readable by another account even for
+/// the moment the write takes.
+fn seal_destination(sink: &File, dst: &Path) -> io::Result<()> {
+    sink.set_permissions(fs::Permissions::from_mode(FILE_MODE))
+        .map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("cannot set the mode of '{}': {err}", dst.display()),
+            )
+        })
+}
+
+/// Copy `source` into `sink` until the source ends or `limit` bytes have
+/// moved, then refuse a source that still has one byte left.
+///
+/// The cap lives in the reads themselves: no read is ever larger than what
+/// `limit` still allows, so an oversized source can neither be buffered nor
+/// written, and the extra byte is looked for on the read that follows the
+/// cap instead of on a second pass over the file.
+fn copy_capped(
+    source: &mut File,
+    sink: &mut File,
+    src: &Path,
+    dst: &Path,
+    limit: u64,
+) -> io::Result<()> {
+    let mut buffer = [0u8; COPY_BUFFER];
+    let mut copied: u64 = 0;
+    while copied < limit {
+        // What the cap still allows, at most one buffer. A `limit` wider
+        // than `usize` (32-bit target, huge cap) only means "a full buffer".
+        let room = usize::try_from(limit - copied)
+            .unwrap_or(COPY_BUFFER)
+            .min(COPY_BUFFER);
+        let read = source
+            .read(&mut buffer[..room])
+            .map_err(|err| read_error(src, err))?;
+        if read == 0 {
+            return Ok(());
+        }
+        copied += read as u64;
+        sink.write_all(&buffer[..read])
+            .map_err(|err| write_error(dst, err))?;
+    }
+    // Exactly at the cap. One byte is enough to know the source is over it,
+    // and that byte is never written: a snapshot shorter than its source
+    // would be a corrupt one.
+    let mut probe = [0u8; 1];
+    if source
+        .read(&mut probe)
+        .map_err(|err| read_error(src, err))?
+        != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "'{}' grew past the {limit}-byte limit while it was copied",
+                src.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Re-measure the file that was just copied, through the handle that read
+/// it, and refuse the copy unless it is still what [`bounded_copy`]
+/// measured: a database rewritten under us must never be snapshotted as an
+/// old head plus a new tail.
+///
+/// Comparing the handle's own stats — instead of a second `stat` of the
+/// path — is what makes that verdict hold: a source renamed or replaced
+/// mid-copy can no longer stand in for the file whose bytes were read.
+fn verify_unchanged(source: &File, src: &Path, before: &Metadata) -> io::Result<()> {
+    let after = source.metadata().map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("cannot re-inspect '{}': {err}", src.display()),
+        )
+    })?;
+    if signature_unchanged(before, &after) {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("'{}' changed while it was copied", src.display()),
+    ))
+}
+
+/// Take away a destination [`bounded_copy`] created or truncated. Best
+/// effort, like the [`PrivateTempDir`] drop: the copy has already failed,
+/// and letting a cleanup failure hide that first error would trade a known
+/// problem for an unknown one.
+fn remove_destination(dst: &Path) {
+    if let Err(err) = fs::remove_file(dst)
+        && err.kind() != io::ErrorKind::NotFound
+    {
+        log::warn(format!(
+            "cannot remove the partial copy '{}': {err}",
+            dst.display()
+        ));
+    }
+}
+
+/// A read failure, tagged with the source it came from.
+fn read_error(src: &Path, err: io::Error) -> io::Error {
+    io::Error::new(
+        err.kind(),
+        format!("cannot read from '{}': {err}", src.display()),
+    )
+}
+
+/// A write failure, tagged with the destination it went to.
+fn write_error(dst: &Path, err: io::Error) -> io::Error {
+    io::Error::new(
+        err.kind(),
+        format!("cannot write '{}': {err}", dst.display()),
+    )
 }
 
 /// Uid of the running process.
