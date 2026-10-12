@@ -35,10 +35,8 @@
 //! private paths on their own.
 
 use std::borrow::Cow;
-use std::ffi::CString;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -273,12 +271,13 @@ fn runtime_base() -> RuntimeBase {
 
 /// Refuse a runtime directory that is not safe to use: a symlink (the
 /// pre-planted entry of a hostile shared `/tmp`), a non-directory, or a
-/// directory owned by another user (`stat` through [`owner_uid`], so a
-/// link cannot hide a foreign owner). A directory the caller owns with a
+/// directory owned by another user. A directory the caller owns with a
 /// drifted mode is accepted — [`runtime_dir`] repairs it.
 fn audit_existing(dir: &Path) -> io::Result<()> {
-    // lstat first: a symlink is never adopted, even when it points at a
-    // directory that looks perfectly fine.
+    // One lookup answers the whole audit, so a directory that is swapped
+    // between a type check and an owner check cannot slip through. A
+    // symlink is never adopted, even when it points at a directory that
+    // looks perfectly fine.
     let meta = fs::symlink_metadata(dir).map_err(|err| {
         io::Error::new(
             err.kind(),
@@ -297,13 +296,8 @@ fn audit_existing(dir: &Path) -> io::Result<()> {
             format!("runtime dir path '{}' is not a directory", dir.display()),
         ));
     }
-    let owner = owner_uid(dir).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("cannot tell who owns runtime dir '{}'", dir.display()),
-        )
-    })?;
     let uid = current_uid();
+    let owner = meta.uid();
     if owner != uid {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -338,24 +332,6 @@ fn create_private_dir(path: &Path) -> io::Result<()> {
         })?;
     // mkdir's mode is masked by the umask; enforce the exact value.
     set_mode(path, DIR_MODE)
-}
-
-/// Owner uid of `path` as `libc::stat` reports it (following symlinks, so
-/// the value describes the effective file). `None` when the path cannot be
-/// expressed as a C string or the call fails.
-fn owner_uid(path: &Path) -> Option<u32> {
-    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
-    // SAFETY: `libc::stat` is a plain-old-data struct of integer fields, so
-    // an all-zero bit pattern is valid, and the slot is a local this thread
-    // owns. `libc::stat` overwrites every field it fills before returning,
-    // and `st_uid` is only read when the call reported success (`rc == 0`),
-    // so no uninitialized field is ever observed.
-    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-    // SAFETY: `c_path` is a NUL-terminated buffer that stays alive for the
-    // whole call, and `stat` is a stack slot of exactly the type libc
-    // writes into; nothing else aliases either.
-    let rc = unsafe { libc::stat(c_path.as_ptr(), &mut stat) };
-    (rc == 0).then_some(stat.st_uid)
 }
 
 /// Uid of the running process.

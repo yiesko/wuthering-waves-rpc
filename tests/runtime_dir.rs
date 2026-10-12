@@ -252,9 +252,11 @@ fn test_private_temp_dir_new_is_unique() {
 
 /// Pins that [`create_private_file`] writes a 0600 file and refuses any
 /// destination that already exists — a regular file as much as a
-/// pre-planted symlink, whose target must stay untouched.
+/// pre-planted symlink, whose target must stay untouched. The env guard is
+/// held because [`fixture`] reads `TMPDIR`.
 #[test]
 fn test_create_private_file_mode_and_symlink_refusal() {
+    let _env = EnvGuard::new();
     let dir = fixture("file");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
