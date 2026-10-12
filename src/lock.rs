@@ -93,9 +93,11 @@ pub struct SingleInstance {
 impl SingleInstance {
     /// Take the single-instance lock in `dir`.
     ///
-    /// `dir` is created when missing and `dir/wwrpc.lock` is created when
-    /// missing; an existing lock file is reused as it is, because the file
-    /// is not the lock — the descriptor is.
+    /// `dir` is the private runtime directory
+    /// ([`runtime_dir`](crate::runtime_dir::runtime_dir)), created when
+    /// missing so a caller may hand over a fresh path, and `dir/wwrpc.lock`
+    /// is created when missing; an existing lock file is reused as it is,
+    /// because the file is not the lock — the descriptor is.
     ///
     /// # Errors
     ///

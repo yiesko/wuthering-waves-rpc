@@ -35,8 +35,9 @@ What your Discord profile looks like with wwrpc running:
   official app links the status to the in-Discord WuWa page, with
   portraits via `--game-page-portraits` (zero uploads). (Details: Game
   page.)
-* **Read-only and private.** Game files are only ever byte-copied to
-  tmpfs and queried there; uids and account values never reach logs —
+* **Read-only and private.** Game files are only ever byte-copied to a
+  private runtime directory (RAM when `$XDG_RUNTIME_DIR` is set) and
+  queried there; uids and account values never reach logs —
   or anywhere beyond Discord's local IPC. (Details: Safety, Data
   sources.)
 * **Multi-account friendly.** The live login is re-resolved each tick,
@@ -131,10 +132,11 @@ detect → snapshot + triage + enrichment → publish tier → send (dedup + hea
 # Safety
 
 Game files are **never opened as SQLite, never written, never chmodded,
-never kept open**. Each tick byte-copies the database (+ journal) to
-tmpfs, rejects the copy if the source changed mid-copy (`mtime`), queries
-only the copy, then deletes it. The same copy-to-RAM rule covers the
-telemetry, device and launcher-cache reads.
+never kept open**. Each tick byte-copies the database (+ journal) to the
+private runtime directory, rejects the copy if the source changed
+mid-copy (`mtime`), queries only the copy, then deletes it. The same
+copy-to-private-snapshot rule covers the telemetry, device and
+launcher-cache reads.
 
 Background: the game abandons `LocalStorage.db` (spawning
 `LocalStorage2.db`, … and resetting settings) if the file is held open
@@ -148,7 +150,7 @@ copy step.
 
 # Data sources
 
-Read from RAM copies only:
+Read from private copies only:
 
 | Source | Provides |
 | --- | --- |

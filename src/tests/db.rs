@@ -109,7 +109,7 @@ fn refresh_reads_copy_and_caches_by_mtime() {
     assert_eq!(reader.refresh(), Refresh::Updated);
     assert_eq!(reader.last_info().unwrap().union_level, "60".to_string());
     assert_eq!(reader.last_info().unwrap().region, "Europe".to_string());
-    // No snapshot leftovers: the RAM copy is deleted after each read.
+    // No snapshot leftovers: the private copy is deleted after each read.
     assert!(!snap.join("snapshot.db").exists());
 
     // Unchanged file: no re-read.

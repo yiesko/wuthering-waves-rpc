@@ -23,9 +23,12 @@
 //!   directory owned by another user is refused (anyone can pre-create an
 //!   entry in shared `/tmp`), and a directory we own has its `0700` mode
 //!   repaired when it drifted.
-//! - Every path is created exclusively (`O_EXCL` / `create_new`) and a
-//!   pre-existing symlink is refused instead of followed, so a hostile
-//!   shared temp dir cannot redirect a snapshot elsewhere.
+//! - A file that must inherit nothing is created exclusively (`O_EXCL` /
+//!   `create_new`), and no file is ever written through a symlink, so a
+//!   hostile shared temp dir cannot redirect a snapshot elsewhere. A file
+//!   that *must* be replaced — the daemon re-copies it every tick, and
+//!   nothing ever empties the directory it lands in — is truncated in
+//!   place instead; [`DestMode`] is the whole of that decision.
 //! - [`PrivateTempDir`] is RAII: the directory and its contents are removed
 //!   when the guard is dropped.
 //! - [`bounded_copy`] is the only way a snapshot reaches those files: it
@@ -33,23 +36,16 @@
 //!   many bytes, proves the source did not change under it, and takes the
 //!   destination away again whenever it cannot finish.
 //!
-//! The daemon does not come through [`runtime_dir`] yet, so the
-//! directory-level rules above are missing on the path that matters most: it
-//! names its own runtime directory (`$XDG_RUNTIME_DIR/wwrpc`) and creates it
-//! with `fs::create_dir_all`, which gives that directory the umask's mode and
-//! no audit at all. The files inside it still get the rest, because
-//! [`bounded_copy`] pins `0600` through the handle, refuses a symlink and
-//! caps the bytes. The lock file has its own rules again, from
-//! [`SingleInstance::acquire`](crate::lock::SingleInstance::acquire):
-//! `O_NOFOLLOW`, mode pinned to `0600`, an existing file reused rather than
-//! refused, no uid-named fallback, and the file left behind when its holder
-//! goes. Routing the binary through [`runtime_dir`] is what would hand the
-//! directory and the lock the whole list above.
-//!
-//! Snapshot and scratch paths are this module's job: a caller must not build
-//! one by hand, because the directory rules above are the reason they are
-//! private. The `--print-activity` path builds its own scratch directory in
-//! the shared temp dir today, and owns whatever privacy that gives it.
+//! Every path the binary writes comes through here: the daemon's snapshots
+//! and its instance lock share one [`runtime_dir`], and the `--list-accounts`
+//! and `--print-activity` scratch directories are [`PrivateTempDir`]s inside
+//! it. A caller must not build a snapshot or scratch path by hand — the
+//! directory rules above are the reason they are private. The lock file
+//! keeps two rules of its own, from
+//! [`SingleInstance::acquire`](crate::lock::SingleInstance::acquire): it is
+//! reused when it already exists rather than refused (refusing it would
+//! hand every later start a lock nothing holds), and it is left behind when
+//! its holder goes.
 
 use std::borrow::Cow;
 use std::fs::{self, File, Metadata, OpenOptions};
@@ -176,7 +172,7 @@ impl PrivateTempDir {
 
 impl Drop for PrivateTempDir {
     fn drop(&mut self) {
-        // Best effort: a reboot already discarded the tmpfs, and a cleanup
+        // Best effort: the directory is scratch either way, and a cleanup
         // failure must never turn a successful run into a panic.
         if let Err(err) = fs::remove_dir_all(&self.path)
             && err.kind() != io::ErrorKind::NotFound

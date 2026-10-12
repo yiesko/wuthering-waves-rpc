@@ -6,12 +6,12 @@
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version. See COPYING for details.
 
-//! LocalStorage reader with copy-to-RAM semantics.
+//! LocalStorage reader with copy-to-a-private-snapshot semantics.
 //!
 //! Safety model: the live game files
 //! are NEVER opened with SQLite, never written to, never chmodded and
 //! never kept open. Each tick we copy `LocalStorage.db` (+ journal) into a
-//! tmpfs snapshot dir through [`bounded_copy`], which refuses a source past
+//! private snapshot dir through [`bounded_copy`], which refuses a source past
 //! [`MAX_DB_BYTES`] (past [`MAX_JSON_BYTES`] for the launcher cache), caps
 //! the bytes it moves and proves the source did not change mid-copy. Only
 //! the private copy is queried, and it is deleted right after. From the
@@ -22,8 +22,9 @@
 //! that lands in the private runtime directory is *replaced*: a run killed
 //! mid-copy leaves its file there and nothing ever empties that directory, so
 //! obeying that file would cost every later run its data. A one-shot listing
-//! copies into a directory built for that single call, where an entry already
-//! on the path is refused rather than adopted.
+//! copies into a [`PrivateTempDir`] built for that single call, where an
+//! entry already on the path is refused rather than adopted — the second
+//! line of defence behind a directory nobody else can write into.
 
 use std::collections::HashMap;
 use std::fs;
@@ -33,7 +34,7 @@ use std::time::SystemTime;
 use serde_json::Value;
 
 use crate::log;
-use crate::runtime_dir::{DestMode, bounded_copy};
+use crate::runtime_dir::{DestMode, PrivateTempDir, bounded_copy};
 
 const MAIN_DB: &str = "LocalStorage.db";
 /// Steam AppId, locating the Proton prefix (`compatdata/<id>/...`) for
@@ -135,7 +136,7 @@ impl std::fmt::Display for TriageError {
     }
 }
 
-/// Polling reader over the game's `LocalStorage`: copy-to-RAM snapshot,
+/// Polling reader over the game's `LocalStorage`: copy-to-private-snapshot,
 /// ordered triage, and best-effort enrichment (display name, version).
 /// One tick is [`DbReader::refresh`]; the freshest accepted data is
 /// [`DbReader::last_info`]. Never fails hard: every problem degrades to
@@ -178,7 +179,9 @@ pub struct DbReader {
 
 impl DbReader {
     /// Open a reader: `storage_dir` holds the live `LocalStorage.db`,
-    /// `snapshot_dir` (tmpfs) holds the private per-tick copies, and
+    /// `snapshot_dir` holds the private per-tick copies — the
+    /// [`runtime_dir`](crate::runtime_dir::runtime_dir) directory in the
+    /// daemon's case, a [`PrivateTempDir`] for a dry run — and
     /// `uid_override` (`--kuro-uid`) wins over auto-detection when set.
     /// Creates the snapshot dir; reads nothing yet (see `refresh`).
     pub fn new(
@@ -574,11 +577,12 @@ impl DbReader {
         let _ = fs::remove_file(path);
     }
 
-    /// Live display name for one login uid: exact `role_id` match over a RAM
+    /// Live display name for one login uid: exact `role_id` match over a private
     /// copy of the launcher telemetry database. Best-effort by construction:
     /// rows are ephemeral (written at login, deleted after upload), so
-    /// absence is normal and never an error. Follows the same copy-to-RAM
-    /// rules as every other game file read, cap included.
+    /// absence is normal and never an error. Follows the same
+    /// copy-to-private-snapshot rules as every other game file read, cap
+    /// included.
     fn live_role_name(&self, role_uid: &str) -> Option<String> {
         let kd_src = kddata_path(self.game_dir.as_ref()?)?;
         let snap_dir = self.snap_db.parent()?;
@@ -592,10 +596,11 @@ impl DbReader {
         name
     }
 
-    /// Identity recovery for one login uid from a PRIVATE RAM copy of the
+    /// Identity recovery for one login uid from a PRIVATE copy of the
     /// launcher telemetry database, live rows AND deleted-row remnants
-    /// (see [`find_remnant_role`]). Same copy-to-RAM rules and size cap as
-    /// [`DbReader::live_role_name`]; best-effort, values never logged.
+    /// (see [`find_remnant_role`]). Same copy-to-private-snapshot rules and
+    /// size cap as [`DbReader::live_role_name`]; best-effort, values never
+    /// logged.
     fn remnant_role(&self, role_uid: &str) -> (Option<RemnantRole>, RemnantStats) {
         let none = (None, RemnantStats::default());
         let Some(game_dir) = self.game_dir.as_deref() else {
@@ -631,23 +636,24 @@ impl DbReader {
     }
 
     /// One-shot account listing for `--list-accounts`: copies the database
-    /// to a temp dir, triages it like a tick would, and returns accounts in
-    /// file order with login nicknames attached when locatable. Uids never
-    /// leave this function, so the listing is safe to print.
+    /// into a private scratch directory of this call's own, triages it like
+    /// a tick would, and returns accounts in file order with login
+    /// nicknames attached when locatable. Uids never leave this function,
+    /// so the listing is safe to print.
     pub fn list_accounts(
         storage_dir: &Path,
         game_dir: &Path,
     ) -> Result<Vec<StoredAccount>, TriageError> {
-        // Unique per call: tests (and paranoid operators) run these concurrently.
-        static LIST_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let tag = LIST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let snap_dir =
-            std::env::temp_dir().join(format!("wwrpc-list-{}-{tag}", std::process::id()));
-        fs::create_dir_all(&snap_dir).map_err(|_| TriageError::Unopenable)?;
-        let snap_db = snap_dir.join("snapshot.db");
-        let outcome = Self::query_list(&snap_db, storage_dir, game_dir);
-        let _ = fs::remove_dir_all(&snap_dir);
-        outcome
+        // A scratch directory created for this call alone, inside the
+        // private runtime directory and gone when the guard drops — no
+        // shared temp dir, and nothing for a concurrent listing to trip
+        // over. A failure here is about that directory, not the database,
+        // so it says which before collapsing into the triage verdict.
+        let scratch = PrivateTempDir::new("list").map_err(|err| {
+            log::warn(format!("cannot create the listing scratch dir: {err}"));
+            TriageError::Unopenable
+        })?;
+        Self::query_list(&scratch.path().join("snapshot.db"), storage_dir, game_dir)
     }
 
     fn query_list(
@@ -657,7 +663,8 @@ impl DbReader {
     ) -> Result<Vec<StoredAccount>, TriageError> {
         // A listing copies into a directory created for this call alone, so
         // every snapshot starts from nothing: an entry already on the path
-        // is refused, not adopted.
+        // is refused, not adopted — a second barrier behind the private,
+        // owner-only directory the copies land in.
         bounded_copy(
             &storage_dir.join(MAIN_DB),
             snap_db,
@@ -682,8 +689,9 @@ impl DbReader {
         check_integrity(&conn)?;
         let body = get_value(&conn, "SdkLevelData")?;
         let accounts = parse_sdk_accounts(&body).ok_or(TriageError::Malformed("SdkLevelData"))?;
-        // Launcher files follow the same copy-to-RAM rule: snapshot them into
-        // our temp dir and read only the copies, never the originals.
+        // Launcher files follow the same copy-to-private-snapshot rule: snapshot
+        // them into our scratch dir and read only the copies, never the
+        // originals.
         let (nicknames, last_login) = match launcher_cache_path(game_dir) {
             Some(cache_src) if snap_db.parent().is_some() => {
                 let snap_dir = snap_db.parent().expect("snapshot has a parent dir");
@@ -802,7 +810,7 @@ pub(crate) const MAX_REMANT_AGE_MS: u64 = 24 * 60 * 60 * 1000;
 const REMNANT_SKEW_MS: u64 = 5 * 60 * 1000;
 const MAX_REMANT_CANDIDATES: usize = 64;
 
-/// Recover `(name, level, server)` for one login uid from a PRIVATE RAM
+/// Recover `(name, level, server)` for one login uid from a PRIVATE
 /// copy of the launcher telemetry database — including deleted-row
 /// remnants. The launcher uploads telemetry rows and deletes them, so
 /// live queries usually find nothing; the bytes remain until vacuumed,
@@ -1040,9 +1048,9 @@ pub(crate) fn read_nicknames(cache_path: &Path) -> HashMap<String, String> {
 }
 
 /// Game version from the device database (`DeviceSaved/DeviceStorage.db`,
-/// key `PatchVersion`). Same copy-to-RAM rules as the main database, byte
-/// ceiling included; best-effort: any failure yields `None` without
-/// affecting triage.
+/// key `PatchVersion`). Same copy-to-private-snapshot rules as the main
+/// database, byte ceiling included; best-effort: any failure yields `None`
+/// without affecting triage.
 fn read_device_version(storage_dir: &Path, snap_db: &Path) -> Option<String> {
     let device_src = storage_dir.parent()?.join("DeviceSaved/DeviceStorage.db");
     if !device_src.is_file() {

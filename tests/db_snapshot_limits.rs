@@ -27,12 +27,14 @@ use std::sync::{Mutex, MutexGuard};
 use rusqlite::Connection;
 
 use wwrpc::db::{DbReader, MAX_DB_BYTES, MAX_JSON_BYTES, Refresh, TriageError};
+use wwrpc::runtime_dir::runtime_dir;
 
 /// Prefix of every fixture directory this file creates.
 const FIXTURE_PREFIX: &str = "wwrpc-limits";
 
-/// Serializes the tests that call [`DbReader::list_accounts`]: it names its
-/// temp directory after the pid, and one test asserts on the leftovers.
+/// Serializes the tests that call [`DbReader::list_accounts`]: it copies
+/// into a scratch directory named after this process, and one test
+/// asserts that no such directory survives.
 static LIST_LOCK: Mutex<()> = Mutex::new(());
 
 /// Holds [`LIST_LOCK`], recovering from a panic in an earlier test.
@@ -106,10 +108,14 @@ fn write_oversized_launcher_cache(root: &Path) {
     .expect("the launcher cache is written");
 }
 
-/// Temp directories `list_accounts` would have left behind in this process.
+/// Scratch directories `list_accounts` would have left behind in the
+/// private runtime directory it copies into: a leftover there is a guard
+/// that never dropped. The name carries this process's pid, so a listing
+/// running in another test binary is never mistaken for one of ours.
 fn list_dirs() -> Vec<PathBuf> {
+    let base = runtime_dir().expect("the private runtime directory is available");
     let prefix = format!("wwrpc-list-{}-", std::process::id());
-    fs::read_dir(std::env::temp_dir())
+    fs::read_dir(base)
         .into_iter()
         .flatten()
         .flatten()
@@ -165,7 +171,7 @@ fn test_device_version_rejects_oversized() {
 
 /// Pins the ceiling on the account listing: an oversized database is refused
 /// before it is copied, so the listing fails instead of reading a snapshot
-/// nobody bounded — and the temp directory it created is gone either way.
+/// nobody bounded — and the scratch directory it created is gone either way.
 #[test]
 fn test_query_list_rejects_oversized() {
     let _lock = list_lock();
@@ -183,8 +189,7 @@ fn test_query_list_rejects_oversized() {
     let leftovers = list_dirs();
     assert!(
         leftovers.is_empty(),
-        "the listing must not leave a temp dir behind: {:?}",
-        leftovers
+        "the listing must not leave its scratch dir behind: {leftovers:?}"
     );
 
     let _ = fs::remove_dir_all(&root);
