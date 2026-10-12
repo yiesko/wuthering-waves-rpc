@@ -143,7 +143,8 @@ Background: the game abandons `LocalStorage.db` (spawning
 elsewhere — so a sentinel watches the folder and, if a numbered database
 ever appears, wwrpc stops touching game files for the session and logs
 loudly. Never set game files read-only; `--no-database` removes even the
-copy step.
+copy step, except for `--list-accounts`, which exists to read the database
+and still makes its one private copy.
 
 > Reading local game files may breach the game's ToS. Use at your own
 > risk; not affiliated with Kuro Games.
