@@ -6,11 +6,13 @@
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version. See COPYING for details.
 
-//! Private runtime directory: the one place wwrpc writes temp state.
+//! Private runtime directory: the rules for every temporary path wwrpc
+//! writes — the snapshot of the game database, its sidecars, the instance
+//! lock.
 //!
-//! Snapshots of the game database, their sidecars and the instance lock all
-//! live in the per-user runtime directory (`$XDG_RUNTIME_DIR`, tmpfs by
-//! spec) guarded so no other account can read them or pre-empt them:
+//! All of them belong in one guarded per-user runtime directory
+//! (`$XDG_RUNTIME_DIR`, tmpfs by spec) that no other account can read or
+//! pre-empt:
 //!
 //! - Directories are `0700` and files `0600`, enforced after creation so
 //!   even a strange umask cannot widen them.
@@ -32,6 +34,7 @@
 //! Creating a temp path is this module's job alone: callers must not build
 //! private paths on their own.
 
+use std::borrow::Cow;
 use std::ffi::CString;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -75,32 +78,36 @@ const NAME_ATTEMPTS: u32 = 64;
 /// user.
 pub fn runtime_dir() -> io::Result<PathBuf> {
     let base = runtime_base();
-    let dir = base.join(runtime_subdir(&base));
+    let dir = base.path().join(base.subdir());
     match create_private_dir(&dir) {
-        Ok(()) => {}
-        // A set-but-stale `XDG_RUNTIME_DIR` (login manager gone) is rebuilt
-        // once, then the exclusive create is retried.
+        // Fresh create: mkdir's mode plus the set_mode inside
+        // `create_private_dir` already leave it exactly `0700`.
+        Ok(()) => return Ok(dir),
+        // A set-but-stale base (login manager gone) is rebuilt once, then
+        // the exclusive create is retried.
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir_all(&base).map_err(|err| {
+            let base = base.path();
+            fs::create_dir_all(base).map_err(|err| {
                 io::Error::new(
                     err.kind(),
                     format!("cannot create runtime base '{}': {err}", base.display()),
                 )
             })?;
             match create_private_dir(&dir) {
-                Ok(()) => {}
-                // Another run got there first: audit the shared entry.
+                Ok(()) => return Ok(dir),
+                // Another run of ours got there first: repair below.
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(err) => return Err(err),
             }
         }
-        // Already there — ours or hostile: the audit decides.
+        // Already there — ours or hostile: the audit below decides.
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
         Err(err) => return Err(err),
     }
+    // The entry already existed. The audit refuses anything that is not a
+    // directory we own; once it has passed, a drifted mode is repaired
+    // rather than rejected, so one bad startup cannot disable the service.
     audit_existing(&dir)?;
-    // Repair the mode when it drifted: the directory is known to be ours by
-    // now, and a snapshot dir is never group- or world-readable.
     set_mode(&dir, DIR_MODE)?;
     Ok(dir)
 }
@@ -175,9 +182,10 @@ impl Drop for PrivateTempDir {
 /// [`io::ErrorKind::AlreadyExists`] when `path` exists, plus filesystem
 /// errors from creating or writing it.
 pub fn create_private_file(path: &Path, contents: &[u8]) -> io::Result<()> {
-    // Belt and braces: `create_new` below already fails on an existing
-    // destination; this check just names the reason (symlink vs. file) and
-    // keeps the refusal explicit for readers.
+    // Purely diagnostic: the `create_new` below opens with `O_EXCL`, which
+    // is the real guard and already refuses any pre-existing destination.
+    // This check only buys the clearer "refusing to write through it"
+    // message for a planted symlink.
     if fs::symlink_metadata(path).is_ok() {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -211,14 +219,48 @@ pub fn create_private_file(path: &Path, contents: &[u8]) -> io::Result<()> {
         })
 }
 
-/// Usable runtime base: `$XDG_RUNTIME_DIR` when it is absolute and
+/// Where the runtime directory lives, and how much of that base is trusted.
+enum RuntimeBase {
+    /// `$XDG_RUNTIME_DIR`, absolute and non-empty: the spec's per-user
+    /// tmpfs, honored verbatim.
+    Xdg(PathBuf),
+    /// `std::env::temp_dir()`: shared, so neither private nor tmpfs — the
+    /// reason [`runtime_base`] warns about it.
+    Fallback(PathBuf),
+}
+
+impl RuntimeBase {
+    /// The base directory itself.
+    fn path(&self) -> &Path {
+        match self {
+            Self::Xdg(path) | Self::Fallback(path) => path,
+        }
+    }
+
+    /// Directory name inside [`RuntimeBase::path`]. A valid XDG base keeps
+    /// `wwrpc` verbatim — honoring the operator's value is the spec, and a
+    /// foreign-owned entry under it is the XDG contract failing closed. The
+    /// shared fallback is per-user instead: any local account can create an
+    /// entry in a shared temp dir, so a single name would let the first one
+    /// there lock every other user out of it entirely.
+    fn subdir(&self) -> Cow<'_, Path> {
+        match self {
+            Self::Xdg(_) => Cow::Borrowed(Path::new(RUNTIME_SUBDIR)),
+            Self::Fallback(_) => {
+                Cow::Owned(PathBuf::from(format!("{RUNTIME_SUBDIR}-{}", current_uid())))
+            }
+        }
+    }
+}
+
+/// Resolve the runtime base: `$XDG_RUNTIME_DIR` when it is absolute and
 /// non-empty, otherwise the system temp dir with a warning.
-fn runtime_base() -> PathBuf {
+fn runtime_base() -> RuntimeBase {
     if let Some(raw) = std::env::var_os(XDG_RUNTIME_DIR)
         && !raw.is_empty()
         && Path::new(&raw).is_absolute()
     {
-        return PathBuf::from(raw);
+        return RuntimeBase::Xdg(PathBuf::from(raw));
     }
     let fallback = std::env::temp_dir();
     log::warn(format!(
@@ -226,19 +268,7 @@ fn runtime_base() -> PathBuf {
          a shared temp dir is neither private nor tmpfs",
         fallback.display()
     ));
-    fallback
-}
-
-/// Directory name inside the runtime base. The shared temp-dir fallback is
-/// per-user (`wwrpc-<uid>`): any local account can create an entry in
-/// `/tmp`, so a single name would let the first one there lock every other
-/// user out of the fallback path entirely. `$XDG_RUNTIME_DIR` is already
-/// per-user by spec, so it keeps the plain `wwrpc` name.
-fn runtime_subdir(base: &Path) -> String {
-    if base == std::env::temp_dir() {
-        return format!("{RUNTIME_SUBDIR}-{}", current_uid());
-    }
-    RUNTIME_SUBDIR.to_string()
+    RuntimeBase::Fallback(fallback)
 }
 
 /// Refuse a runtime directory that is not safe to use: a symlink (the
@@ -315,6 +345,11 @@ fn create_private_dir(path: &Path) -> io::Result<()> {
 /// expressed as a C string or the call fails.
 fn owner_uid(path: &Path) -> Option<u32> {
     let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `libc::stat` is a plain-old-data struct of integer fields, so
+    // an all-zero bit pattern is valid, and the slot is a local this thread
+    // owns. `libc::stat` overwrites every field it fills before returning,
+    // and `st_uid` is only read when the call reported success (`rc == 0`),
+    // so no uninitialized field is ever observed.
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: `c_path` is a NUL-terminated buffer that stays alive for the
     // whole call, and `stat` is a stack slot of exactly the type libc

@@ -137,31 +137,28 @@ fn test_runtime_dir_rejects_empty_and_relative() {
     );
 }
 
-/// Pins that with no `XDG_RUNTIME_DIR` at all the module still returns the
-/// system temp dir fallback — absolute, under `temp_dir()`, and named per
-/// uid so no single account can squat it.
+/// Pins that with no `XDG_RUNTIME_DIR` at all the module returns the shared
+/// system temp dir fallback, named per uid (`wwrpc-<uid>`) so one account
+/// cannot squat it — and leaves the shared temp dir as it found it.
 #[test]
 fn test_runtime_dir_falls_back_without_env() {
     let env = EnvGuard::new();
     env.clear();
 
+    let uid = std::fs::metadata("/proc/self")
+        .map(|meta| std::os::unix::fs::MetadataExt::uid(&meta))
+        .expect("our own /proc entry is readable");
     let dir = runtime_dir().expect("a missing base falls back to temp_dir");
 
-    assert!(
-        dir.is_absolute() && dir.starts_with(std::env::temp_dir()),
-        "the fallback must be absolute and under temp_dir: '{}'",
-        dir.display()
-    );
-    let name = dir
-        .file_name()
-        .expect("the fallback path has a final component")
-        .to_string_lossy()
-        .into_owned();
-    assert!(
-        name.starts_with("wwrpc-") && name != "wwrpc",
-        "the shared fallback must be named per uid, got '{name}'"
+    assert_eq!(
+        dir,
+        std::env::temp_dir().join(format!("wwrpc-{uid}")),
+        "the shared fallback must be named after the uid"
     );
     assert_eq!(mode_of(&dir), 0o700, "the fallback dir is owner-only");
+
+    // Leave the shared temp dir as we found it.
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Pins that a held [`PrivateTempDir`] exists, is 0700 and carries the
@@ -283,26 +280,40 @@ fn test_runtime_dir_refuses_symlinked_runtime_dir() {
 }
 
 /// Pins that a runtime dir the caller owns is repaired to `0700` instead of
-/// being rejected, and that a missing base (a stale-but-set
-/// `XDG_RUNTIME_DIR`) is rebuilt rather than becoming a hard failure.
+/// being rejected, so a drifted mode (one bad startup, an old version) can
+/// never disable the service.
 #[test]
-fn test_runtime_dir_repairs_mode_and_missing_base() {
+fn test_runtime_dir_repairs_mode_drift() {
     let env = EnvGuard::new();
+    let base = fixture("loose");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("wwrpc")).unwrap();
+    std::fs::set_permissions(base.join("wwrpc"), std::fs::Permissions::from_mode(0o777)).unwrap();
+    env.set(base.to_str().expect("temp dir is utf-8"));
 
-    let loose = fixture("loose");
-    let _ = std::fs::remove_dir_all(&loose);
-    std::fs::create_dir_all(loose.join("wwrpc")).unwrap();
-    std::fs::set_permissions(loose.join("wwrpc"), std::fs::Permissions::from_mode(0o777)).unwrap();
-    env.set(loose.to_str().expect("temp dir is utf-8"));
     let dir = runtime_dir().expect("our own loose dir is repaired, not refused");
+
+    assert_eq!(
+        dir,
+        base.join("wwrpc"),
+        "the runtime dir must sit directly under the configured base"
+    );
     assert_eq!(mode_of(&dir), 0o700, "the mode drifts back to owner-only");
+    let _ = std::fs::remove_dir_all(&base);
+}
 
-    let stale = fixture("stale/missing/root");
-    let _ = std::fs::remove_dir_all(fixture("stale"));
-    env.set(stale.to_str().expect("temp dir is utf-8"));
+/// Pins that a missing base — a `XDG_RUNTIME_DIR` left over from a login
+/// manager that is gone — is rebuilt instead of becoming a hard failure.
+#[test]
+fn test_runtime_dir_rebuilds_missing_base() {
+    let env = EnvGuard::new();
+    let base = fixture("stale");
+    let _ = std::fs::remove_dir_all(&base);
+    env.set(base.to_str().expect("temp dir is utf-8"));
+
     let dir = runtime_dir().expect("a missing base is rebuilt");
-    assert_eq!(dir, stale.join("wwrpc"));
-    assert_eq!(mode_of(&dir), 0o700);
 
-    let _ = std::fs::remove_dir_all(fixture("stale"));
+    assert_eq!(dir, base.join("wwrpc"));
+    assert_eq!(mode_of(&dir), 0o700, "the rebuilt dir is owner-only");
+    let _ = std::fs::remove_dir_all(&base);
 }
