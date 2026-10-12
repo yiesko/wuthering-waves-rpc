@@ -10,11 +10,13 @@
 //!
 //! Safety model: the live game files
 //! are NEVER opened with SQLite, never written to, never chmodded and
-//! never kept open. Each tick we byte-copy `LocalStorage.db` (+ journal)
-//! into a tmpfs snapshot dir, verify the source did not change mid-copy
-//! via `mtime`, and query only the private copy, which is deleted right
-//! after. From the game's perspective this is indistinguishable from a
-//! backup tool: no SQLite locks are ever taken on the live files.
+//! never kept open. Each tick we copy `LocalStorage.db` (+ journal) into a
+//! tmpfs snapshot dir through [`bounded_copy`], which refuses a source past
+//! [`MAX_DB_BYTES`] (past [`MAX_JSON_BYTES`] for the launcher cache), caps
+//! the bytes it moves and proves the source did not change mid-copy. Only
+//! the private copy is queried, and it is deleted right after. From the
+//! game's perspective this is indistinguishable from a backup tool: no
+//! SQLite locks are ever taken on the live files.
 
 use std::collections::HashMap;
 use std::fs;
@@ -24,6 +26,7 @@ use std::time::SystemTime;
 use serde_json::Value;
 
 use crate::log;
+use crate::runtime_dir::{DestMode, bounded_copy};
 
 const MAIN_DB: &str = "LocalStorage.db";
 /// Steam AppId, locating the Proton prefix (`compatdata/<id>/...`) for
@@ -32,9 +35,16 @@ const STEAM_APP_ID: &str = "3513350";
 /// Rolled-back journal today; `-wal`/`-shm` if a future update switches
 /// SQLite modes. Copied alongside so the private snapshot always recovers.
 const SIDECAR_SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
-/// Refuse to copy absurdly large files: a healthy database is kilobytes,
-/// so anything past this is corruption or a wrong directory.
-const MAX_DB_BYTES: u64 = 64 * 1024 * 1024;
+/// Byte ceiling for every game database wwrpc snapshots: a healthy
+/// `LocalStorage`, its sidecars and the device and telemetry databases are
+/// kilobytes, so anything past this is corruption or a wrong directory.
+/// Refused before the copy starts, not truncated into a corrupt snapshot.
+pub const MAX_DB_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Byte ceiling for the launcher account cache: a JSON file describing a
+/// handful of accounts is a few kilobytes, so a megabyte is already
+/// generous.
+pub const MAX_JSON_BYTES: u64 = 1024 * 1024;
 
 /// Identity + stats of one account, as shown in presence.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -306,24 +316,30 @@ impl DbReader {
             return Refresh::Unchanged;
         }
 
-        if fs::copy(&self.src_db, &self.snap_db).is_err() {
+        // The same destination is re-copied every tick, so whatever a killed
+        // run left there is replaced rather than refused; the ceiling is
+        // re-checked on the open source, never taken from the stat above.
+        let copy = bounded_copy(
+            &self.src_db,
+            &self.snap_db,
+            MAX_DB_BYTES,
+            DestMode::Overwrite,
+        );
+        if copy.is_err() {
             log::debug("snapshot copy failed; keeping previous data");
             return self.cached_or_unavailable();
         }
         for (src, snap) in &self.sidecars {
-            // Best effort: without sidecars a torn copy cannot recover.
-            // Oversized ones are skipped for the same sanity reason.
-            let usable = src.exists()
-                && fs::metadata(src)
-                    .map(|meta| meta.len() <= MAX_DB_BYTES)
-                    .unwrap_or(false);
-            if usable {
-                let _ = fs::copy(src, snap);
-            }
+            // Best effort: without sidecars a torn copy cannot recover. A
+            // sidecar that is missing, oversized or rewritten mid-copy is
+            // skipped, and the snapshot it would have filled stays absent.
+            let _ = bounded_copy(src, snap, MAX_DB_BYTES, DestMode::Overwrite);
         }
 
-        // Discard torn copies: the game must not have touched the source
-        // while we were reading it.
+        // Discard torn copies: the game must not have touched the source while
+        // we were reading it. The copy itself already rejects a source that
+        // changed underneath it; this check still covers the sidecars copied
+        // after it.
         let unchanged = fs::metadata(&self.src_db)
             .and_then(|m| m.modified())
             .map(|after| after == mtime)
@@ -554,19 +570,14 @@ impl DbReader {
     /// copy of the launcher telemetry database. Best-effort by construction:
     /// rows are ephemeral (written at login, deleted after upload), so
     /// absence is normal and never an error. Follows the same copy-to-RAM
-    /// rules as every other game file read.
+    /// rules as every other game file read, cap included.
     fn live_role_name(&self, role_uid: &str) -> Option<String> {
         let kd_src = kddata_path(self.game_dir.as_ref()?)?;
-        // Same sanity cap as the main database.
-        if fs::metadata(&kd_src)
-            .map(|meta| meta.len() > MAX_DB_BYTES)
-            .unwrap_or(true)
-        {
-            return None;
-        }
         let snap_dir = self.snap_db.parent()?;
         let snap_copy = snap_dir.join("kdnames.db");
-        fs::copy(&kd_src, &snap_copy).ok()?;
+        // Read by this one lookup and removed right after, so it must start
+        // from nothing rather than inherit whatever is on the path.
+        bounded_copy(&kd_src, &snap_copy, MAX_DB_BYTES, DestMode::Fresh).ok()?;
         let name = query_kd_names(&snap_copy, role_uid);
         Self::remove_quiet(&snap_copy);
         name
@@ -585,19 +596,16 @@ impl DbReader {
             log::debug("telemetry scan skipped: no telemetry database located");
             return none;
         };
-        if fs::metadata(&kd_src)
-            .map(|meta| meta.len() > MAX_DB_BYTES)
-            .unwrap_or(true)
-        {
-            log::debug("telemetry scan skipped: database exceeds sanity size");
-            return none;
-        }
         let Some(snap_dir) = self.snap_db.parent() else {
             return none;
         };
         let snap_copy = snap_dir.join("kdremnant.db");
-        if fs::copy(&kd_src, &snap_copy).is_err() {
-            log::debug("telemetry scan skipped: copy failed");
+        // Read by this one scan and removed right after, so it must start from
+        // nothing rather than inherit whatever is on the path. A copy refused
+        // here (too large, rewritten mid-copy) reads its reason from the
+        // error, the way the size check used to report it.
+        if let Err(err) = bounded_copy(&kd_src, &snap_copy, MAX_DB_BYTES, DestMode::Fresh) {
+            log::debug(format!("telemetry scan skipped: copy failed ({err})"));
             return none;
         }
         let bytes = fs::read(&snap_copy).ok();
@@ -637,12 +645,25 @@ impl DbReader {
         storage_dir: &Path,
         game_dir: &Path,
     ) -> Result<Vec<StoredAccount>, TriageError> {
-        fs::copy(storage_dir.join(MAIN_DB), snap_db).map_err(|_| TriageError::Unopenable)?;
+        // A listing copies into a directory created for this call alone, so
+        // every snapshot starts from nothing: an entry already on the path
+        // is refused, not adopted.
+        bounded_copy(
+            &storage_dir.join(MAIN_DB),
+            snap_db,
+            MAX_DB_BYTES,
+            DestMode::Fresh,
+        )
+        .map_err(|_| TriageError::Unopenable)?;
         if let Some(snap_dir) = snap_db.parent() {
             for suffix in SIDECAR_SUFFIXES {
-                let _ = fs::copy(
-                    storage_dir.join(format!("{MAIN_DB}{suffix}")),
-                    snap_dir.join(format!("snapshot.db{suffix}")),
+                // Best effort, exactly as on the per-tick path: recovery
+                // data is a bonus, never a reason to fail a listing.
+                let _ = bounded_copy(
+                    &storage_dir.join(format!("{MAIN_DB}{suffix}")),
+                    &snap_dir.join(format!("snapshot.db{suffix}")),
+                    MAX_DB_BYTES,
+                    DestMode::Fresh,
                 );
             }
         }
@@ -657,7 +678,9 @@ impl DbReader {
             Some(cache_src) if snap_db.parent().is_some() => {
                 let snap_dir = snap_db.parent().expect("snapshot has a parent dir");
                 let snap_cache = snap_dir.join("launcher-cache.json");
-                if fs::copy(&cache_src, &snap_cache).is_err() {
+                // A JSON cache gets its own, much smaller ceiling: the real
+                // file holds a handful of accounts in a few kilobytes.
+                if bounded_copy(&cache_src, &snap_cache, MAX_JSON_BYTES, DestMode::Fresh).is_err() {
                     (HashMap::new(), None)
                 } else {
                     let nicknames = read_nicknames(&snap_cache);
@@ -1002,15 +1025,18 @@ pub(crate) fn read_nicknames(cache_path: &Path) -> HashMap<String, String> {
 }
 
 /// Game version from the device database (`DeviceSaved/DeviceStorage.db`,
-/// key `PatchVersion`). Same copy-to-RAM rules as the main database;
-/// best-effort: any failure yields `None` without affecting triage.
+/// key `PatchVersion`). Same copy-to-RAM rules as the main database, byte
+/// ceiling included; best-effort: any failure yields `None` without
+/// affecting triage.
 fn read_device_version(storage_dir: &Path, snap_db: &Path) -> Option<String> {
     let device_src = storage_dir.parent()?.join("DeviceSaved/DeviceStorage.db");
     if !device_src.is_file() {
         return None;
     }
     let snap_copy = snap_db.parent()?.join("device.db");
-    fs::copy(&device_src, &snap_copy).ok()?;
+    // Nothing else bounds this file: a runaway device database must be
+    // refused here, not copied into the snapshot directory byte by byte.
+    bounded_copy(&device_src, &snap_copy, MAX_DB_BYTES, DestMode::Fresh).ok()?;
     let version = rusqlite::Connection::open(&snap_copy)
         .ok()
         .and_then(|conn| {
