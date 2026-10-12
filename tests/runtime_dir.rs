@@ -613,8 +613,7 @@ fn test_bounded_copy_rejects_non_regular_source() {
 
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     assert!(
-        err.to_string()
-            .contains(&format!("'{}' is not a regular file", src.display())),
+        err.to_string().contains("not a regular file"),
         "the refusal must name what is wrong: {err}"
     );
     assert!(

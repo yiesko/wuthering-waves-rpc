@@ -243,15 +243,22 @@ pub enum DestMode {
 /// The copy is bounded in three places, because a game database is a file
 /// another process keeps writing while we read it:
 ///
-/// - The source is measured first: over `limit` bytes is refused before
-///   the destination is created, so a runaway file costs nothing.
-/// - The bytes are read through a handle already held, in chunks that never
-///   read past `limit` — never with an unbounded `fs::copy`. A source with
-///   one byte too many is refused rather than silently truncated into a
-///   corrupt snapshot.
-/// - That same handle is measured again afterwards: [`signature_unchanged`]
-///   must still hold, or the snapshot mixes an old head with a new tail and
-///   is thrown away.
+/// - The source is measured first, through the handle the bytes will come
+///   from: over `limit` bytes is refused before the destination is created,
+///   so a runaway file costs nothing.
+/// - The bytes are read through that same handle, in chunks that never read
+///   past `limit` — never with an unbounded `fs::copy`. A source with one
+///   byte too many is refused rather than silently truncated into a corrupt
+///   snapshot.
+/// - It is measured again afterwards: [`signature_unchanged`] must still
+///   hold, or the snapshot mixes an old head with a new tail and is thrown
+///   away.
+///
+/// Both measurements come from the handle, never from the path: a path read
+/// before the open describes a file that may already be a different one. The
+/// source's *kind* is the one thing checked from the path, and that check runs
+/// before the open, because opening a fifo blocks until a writer appears — in
+/// a long-running daemon, a hang rather than an error.
 ///
 /// A destination that this call created — or, under [`DestMode::Overwrite`],
 /// truncated — is removed on every failure: a half-written snapshot is
@@ -298,7 +305,7 @@ pub(crate) fn bounded_copy_inner(
     mode: DestMode,
     after_measure: impl FnOnce(&Path),
 ) -> io::Result<()> {
-    check_source(src, limit)?;
+    check_regular_file(src)?;
     let mut source = File::open(src).map_err(|err| {
         io::Error::new(
             err.kind(),
@@ -311,9 +318,19 @@ pub(crate) fn bounded_copy_inner(
     let before = source.metadata().map_err(|err| {
         io::Error::new(
             err.kind(),
-            format!("cannot stat '{}': {err}", src.display()),
+            format!("cannot inspect the open '{}': {err}", src.display()),
         )
     })?;
+    if before.len() > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "'{}' is {} bytes, over the {limit}-byte limit",
+                src.display(),
+                before.len()
+            ),
+        ));
+    }
     let mut sink = open_destination(dst, mode)?;
     // From this line on the destination is one this call created or
     // truncated, so every failure has to take it away again.
@@ -331,37 +348,27 @@ pub(crate) fn bounded_copy_inner(
     Ok(())
 }
 
-/// Refuse a source that must not be copied: anything that is not a regular
-/// file, and anything over the caller's byte limit.
+/// Refuse a source that is not a plain file, before the source is opened:
+/// opening a fifo blocks until a writer appears, which in a long-running
+/// daemon is a hang rather than an error.
 ///
-/// Both refusals run before the destination exists, so a refused source costs
-/// nothing — and before the source is *opened*, because opening a fifo blocks
-/// until a writer appears: in a long-running daemon that is a hang, not an
-/// error.
-fn check_source(src: &Path, limit: u64) -> io::Result<()> {
+/// How big the source is, and whether it changes, are deliberately not
+/// decided here — those are questions about the file the bytes are read from,
+/// and [`bounded_copy`] asks them of the handle it holds.
+fn check_regular_file(src: &Path) -> io::Result<()> {
     let stat = fs::metadata(src).map_err(|err| {
         io::Error::new(
             err.kind(),
-            format!("cannot stat '{}': {err}", src.display()),
+            format!("cannot inspect '{}': {err}", src.display()),
         )
     })?;
-    if !stat.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("'{}' is not a regular file", src.display()),
-        ));
+    if stat.is_file() {
+        return Ok(());
     }
-    if stat.len() > limit {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "'{}' is {} bytes, over the {limit}-byte limit",
-                src.display(),
-                stat.len()
-            ),
-        ));
-    }
-    Ok(())
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("'{}' is not a regular file", src.display()),
+    ))
 }
 
 /// Whether two observations of the same file agree on what a copy cares
