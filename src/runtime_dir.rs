@@ -36,16 +36,23 @@
 //!   many bytes, proves the source did not change under it, and takes the
 //!   destination away again whenever it cannot finish.
 //!
-//! Every path the binary writes comes through here: the daemon's snapshots
-//! and its instance lock share one [`runtime_dir`], and the `--list-accounts`
-//! and `--print-activity` scratch directories are [`PrivateTempDir`]s inside
-//! it. A caller must not build a snapshot or scratch path by hand — the
-//! directory rules above are the reason they are private. The lock file
-//! keeps two rules of its own, from
+//! Every path the binary writes into its runtime state comes through here:
+//! the daemon's snapshots and its instance lock share one [`runtime_dir`],
+//! and the `--list-accounts` and `--print-activity` scratch directories are
+//! [`PrivateTempDir`]s inside it. A caller must not build a snapshot or
+//! scratch path by hand — the directory rules above are the reason they are
+//! private. The lock file keeps two rules of its own, from
 //! [`SingleInstance::acquire`](crate::lock::SingleInstance::acquire): it is
 //! reused when it already exists rather than refused (refusing it would
 //! hand every later start a lock nothing holds), and it is left behind when
 //! its holder goes.
+//!
+//! One write is deliberately outside those rules: the detection cache under
+//! `$XDG_CACHE_HOME/wwrpc` (or `~/.cache/wwrpc`) belongs to
+//! [`crate::detect`] and answers to none of them. It is a cache — refilled
+//! from the online database whenever it is missing or stale — so nothing in
+//! it has to be private; auditing that directory means auditing
+//! [`crate::detect`].
 
 use std::borrow::Cow;
 use std::fs::{self, File, Metadata, OpenOptions};
