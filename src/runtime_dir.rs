@@ -6,13 +6,11 @@
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version. See COPYING for details.
 
-//! Private runtime directory: the rules for every temporary path wwrpc
-//! writes — the snapshot of the game database, its sidecars, the instance
-//! lock.
+//! Private runtime directory: the rules for the temporary paths wwrpc
+//! writes — the snapshot of the game database and its sidecars.
 //!
-//! All of them belong in one guarded per-user runtime directory
-//! (`$XDG_RUNTIME_DIR`, tmpfs by spec) that no other account can read or
-//! pre-empt:
+//! [`runtime_dir`] is what applies them, and a path is covered only when its
+//! directory comes from there:
 //!
 //! - Directories are `0700` and files `0600`, enforced after creation so
 //!   even a strange umask cannot widen them.
@@ -35,8 +33,23 @@
 //!   many bytes, proves the source did not change under it, and takes the
 //!   destination away again whenever it cannot finish.
 //!
-//! Creating a temp path is this module's job alone: callers must not build
-//! private paths on their own.
+//! The daemon does not come through [`runtime_dir`] yet, so the
+//! directory-level rules above are missing on the path that matters most: it
+//! names its own runtime directory (`$XDG_RUNTIME_DIR/wwrpc`) and creates it
+//! with `fs::create_dir_all`, which gives that directory the umask's mode and
+//! no audit at all. The files inside it still get the rest, because
+//! [`bounded_copy`] pins `0600` through the handle, refuses a symlink and
+//! caps the bytes. The lock file has its own rules again, from
+//! [`SingleInstance::acquire`](crate::lock::SingleInstance::acquire):
+//! `O_NOFOLLOW`, mode pinned to `0600`, an existing file reused rather than
+//! refused, no uid-named fallback, and the file left behind when its holder
+//! goes. Routing the binary through [`runtime_dir`] is what would hand the
+//! directory and the lock the whole list above.
+//!
+//! Snapshot and scratch paths are this module's job: a caller must not build
+//! one by hand, because the directory rules above are the reason they are
+//! private. The `--print-activity` path builds its own scratch directory in
+//! the shared temp dir today, and owns whatever privacy that gives it.
 
 use std::borrow::Cow;
 use std::fs::{self, File, Metadata, OpenOptions};

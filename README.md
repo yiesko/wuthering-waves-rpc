@@ -251,7 +251,9 @@ vs still missing.
   `small_image`: check YOUR app id, exact lowercase key, propagation
   delay, Discord restart.
 * **Second copy won't start** → by design (`flock` on the lock file);
-  diagnostics never take the lock.
+  diagnostics never take the lock. On some filesystems the kernel refuses a
+  lock for a moment after the previous instance released it, so a start can
+  come back refused once with nothing running — just start it again.
 
 # Testing
 

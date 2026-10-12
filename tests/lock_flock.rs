@@ -8,14 +8,16 @@
 
 //! Integration tests for [`wwrpc::lock`]: who holds `wwrpc.lock`.
 //!
-//! The guarantee is the kernel's, so nothing here is about file content —
-//! the pid inside the lock file is diagnostics, and every test would pass
-//! the same way with a garbage byte there. What is pinned instead is:
+//! Exclusion is never decided from the file's contents, and nothing here
+//! pretends otherwise: the pid inside the lock file is diagnostics, and the
+//! only assertions that read it pin that a holder records its own. What the
+//! tests do pin is:
 //!
 //! - a live holder excludes every other holder, including one racing it;
 //! - releasing the lock is the descriptor closing, so a leftover file is
 //!   not a claim and a killed holder is not a claim;
-//! - the lock file itself is private and stays behind on drop.
+//! - the lock file itself is private, refuses a planted symlink, and stays
+//!   behind on drop.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -216,6 +218,38 @@ fn test_stale_lock_file_does_not_block() {
         holder.pid(),
         Some(std::process::id()),
         "the pid we just wrote is the pid we read"
+    );
+}
+
+/// Pins that a symlink planted where the lock file belongs is refused rather
+/// than followed, and that whatever it pointed at is left exactly as it was:
+/// the lock file is `0600` and rewritten in place, so following a link would
+/// put both on a file the lock never asked for.
+#[test]
+fn test_symlinked_lock_file_is_refused() {
+    let _serial = serial();
+    let dir = Scratch::new("symlink");
+    let decoy = dir.path().join("decoy");
+    std::fs::write(&decoy, "not a lock\n").expect("the decoy is written");
+    let decoy_mode = mode_of(&decoy);
+    std::os::unix::fs::symlink(&decoy, lock_path(dir.path())).expect("the link is planted");
+
+    let err = SingleInstance::acquire(dir.path())
+        .expect_err("a symlinked lock file must be refused instead of followed");
+
+    assert!(
+        err.to_string().contains("cannot open lock file"),
+        "the refusal must name the lock file, in the words the daemon prints: {err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&decoy).expect("the decoy is readable"),
+        "not a lock\n",
+        "the lock must not write through the planted link"
+    );
+    assert_eq!(
+        mode_of(&decoy),
+        decoy_mode,
+        "the lock must not re-mode the planted link's target"
     );
 }
 
