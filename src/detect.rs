@@ -8,15 +8,15 @@
 
 //! Game detection via the rsRPC engine.
 //!
-//! No hardcoded game data: at startup the full Discord detectable
-//! database is fetched online and trimmed with rsRPC's own
-//! [`rsrpc_detect::db::trim_detectable`], keeping only the Wuthering
-//! Waves entry plus a local linux-executable override (Steam AppId
-//! `3513350` covers Steam launches via `/proc/<pid>/environ`; the
-//! override covers Twintail, Heroic, Lutris and plain Wine/Proton,
-//! which set no Steam id). The bundled rsRPC snapshot is the offline
-//! fallback. Each tick then runs one synchronous `detect_once` scan over
-//! `/proc`: no threads, no ports, no game files touched.
+//! No hardcoded game data: whichever database wins at startup is trimmed to
+//! the Wuthering Waves entry plus a local linux-executable override. The
+//! override exists because a non-Steam launcher sets no Steam id at all; it
+//! says which launchers it covers.
+//!
+//! Each tick then runs one synchronous `detect_once` scan. It reads `/proc`
+//! for the processes, and it also refreshes rsRPC's Steam library map and
+//! rewrites that map's cache, so a tick is not confined to `/proc`. No
+//! threads and no ports.
 
 use rsrpc_core::{Daemon, DetectedGame, RPCConfig};
 
@@ -35,13 +35,14 @@ const CACHE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 24
 
 /// Local detection override, merged into the database at startup.
 ///
-/// The online entry only ships `win32`/`darwin` executables, which rsRPC
-/// filters out on Linux, and non-Steam launchers (Twintail, Heroic,
-/// Lutris, plain Wine/Proton) set no `SteamAppId` in `/proc/*/environ`
-/// — so without this, only Steam launches would ever match. Matching is
-/// a mere path suffix (`client-win64-shipping.exe`, any directory), which
-/// is identical across all launchers. This is detection config, not game
-/// data: no hardcoded ids, names or paths beyond the executable name.
+/// The online entry ships no `linux` executable, and a non-Steam launcher
+/// (Twintail, Heroic, Lutris, plain Wine/Proton) sets no `SteamAppId` in
+/// `/proc/*/environ` — so without this, only Steam launches would ever
+/// match. Matching is a mere path suffix (`client-win64-shipping.exe`, any
+/// directory), which is identical across all launchers.
+///
+/// This is detection config, not game data: it adds one executable name and
+/// no path, and takes its id from the constant the rest of the crate uses.
 fn override_entry() -> serde_json::Value {
     serde_json::json!({
       "id": WUWA_ID,
@@ -71,7 +72,8 @@ pub(crate) fn select_wuwa(body: &str) -> Option<String> {
 /// Game detector: the rsRPC engine fed with a WuWa-only database.
 /// Resolution order per construction: fresh disk cache (7 days) → online
 /// fetch (refreshes the cache) → stale cache → bundled snapshot. Owns no
-/// threads or sockets; [`Detector::detect`] only scans `/proc`.
+/// threads or sockets, and a tick reaches past `/proc` to rsRPC's Steam
+/// library map and its cache; [`Detector::detect`] has the detail.
 pub struct Detector {
     daemon: Daemon,
 }
@@ -122,8 +124,10 @@ impl Detector {
         Ok(detector)
     }
 
-    /// Returns the running game, if any. Only reads `/proc`; never touches
-    /// game files, sockets or the network.
+    /// Returns the running game, if any. Synchronous, on the calling
+    /// thread: it reads `/proc`, and it also refreshes and rewrites rsRPC's
+    /// Steam library cache. It starts no thread, binds no port and opens no
+    /// network connection.
     pub fn detect(&self) -> Result<Option<DetectedGame>, Box<dyn std::error::Error>> {
         Ok(self
             .daemon

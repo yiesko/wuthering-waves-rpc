@@ -15,14 +15,13 @@
 //! it publishes anything, so it is true only while a socket is held that
 //! completed a handshake and whose framing still lines up. A candidate
 //! socket becomes the connection after Discord answers its handshake, never
-//! before, and any frame exchange that fails takes the socket back out: a
-//! reply that cannot be read whole leaves the read cursor in the middle of a
-//! body, so whatever bytes follow are read as a frame header, and the client
-//! can no longer tell a reply from noise.
+//! before, and any frame exchange that fails takes it back out: a reply
+//! read half-way leaves the cursor inside a body, and what follows can no
+//! longer be told from a frame header.
 //!
 //! Losing a connection costs one presence tick — the loop reconnects on the
-//! next one — so the client fails the connection instead of keeping a
-//! socket it cannot prove works.
+//! next one — which is why the client fails one it cannot prove instead of
+//! keeping the socket.
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -76,8 +75,8 @@ pub(crate) fn socket_paths() -> Vec<PathBuf> {
     paths
 }
 
-/// Connects to one Discord IPC socket and arms the timeouts that every
-/// read and write on it then runs under.
+/// Connects to one Discord IPC socket and arms the read and write timeouts
+/// that every later read and write on it runs under.
 ///
 /// A connected socket is not a usable one: this proves only that something
 /// is listening at `path`, not that it is Discord and not that it answers.
@@ -97,29 +96,28 @@ pub fn try_socket(path: &Path) -> io::Result<UnixStream> {
 /// Announces `client_id` to Discord and reads the one reply the handshake
 /// owes, leaving `stream` at the first frame that follows it.
 ///
-/// The reply is read, not merely written to: a connection that never
-/// answers — a peer that hung up, a socket that stays silent, a read that
-/// runs into its timeout — is an error here, because the caller cannot tell
-/// such a connection from one whose reply arrived half-read, and only the
-/// second leaves the framing out of step with Discord's.
+/// The reply is read, not merely written to: a peer that never answers — a
+/// hangup, a silent socket, a read that runs into its timeout — is an error
+/// here.
 ///
-/// A reply that refuses the handshake — `evt` set to `ERROR`, or an error
-/// code in `data` — fails it here, carrying Discord's own `message` when it
-/// sent one, so an application id Discord will not accept is diagnosed at
-/// the connection instead of surfacing later as a presence that never
-/// arrives. Nothing else is asked of the reply: a shape this code has never
-/// seen still passes, because a check that demanded today's shape would
-/// break every working connection the first time Discord answered
-/// differently.
+/// Two clauses fail a handshake: `evt` set to `ERROR`, or any `code` in
+/// `data` — presence alone, whatever the value. Discord's own `message`
+/// carries the reason when it sent one, and a reply carrying none is
+/// reported without saying why. Nothing else is asked of the reply, so a
+/// shape this code has never seen still passes.
 ///
 /// `client_id` is the numeric id of the Discord application to publish as,
-/// which Discord itself carries as a string inside the frame. A stream
-/// handed in without timeouts blocks until the peer answers; [`try_socket`]
-/// is what arms them.
+/// carried as a string inside the frame. A stream handed in without timeouts
+/// blocks until the peer answers; [`try_socket`] is what arms them.
 pub fn handshake(stream: &mut UnixStream, client_id: u64) -> io::Result<()> {
     let payload = json!({"v": 1, "client_id": client_id.to_string()});
     write_frame(stream, OP_HANDSHAKE, &payload.to_string())?;
+    // Not best-effort: a caller cannot tell a connection that never
+    // answered from one whose reply arrived half-read, and only the second
+    // leaves the framing out of step with Discord's.
     let reply = read_frame(stream)?;
+    // Not shape-strict on purpose: a check demanding today's reply shape
+    // would turn any future answer from Discord into a broken connection.
     match refusal(&reply) {
         Some(reason) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -129,15 +127,17 @@ pub fn handshake(stream: &mut UnixStream, client_id: u64) -> io::Result<()> {
     }
 }
 
-/// Discord's own reason for refusing, when it refused: an error event or an
-/// error code in `data` says so, and the words come from `data.message` or a
-/// top-level `message`.
+/// The reason a refusal-shaped reply gives, or `None` for every other reply —
+/// including one in a shape this code has never seen.
 ///
-/// Every other reply yields `None`, including one in a shape this code has
-/// never seen, and that asymmetry is the contract: a check demanding a
-/// known shape would turn any future answer from Discord into a broken
-/// connection, while this one can only fail on a refusal Discord stated
-/// outright.
+/// Two clauses make a reply refusal-shaped: `evt` is the string `ERROR`, or
+/// `data` carries a `code` at all. The second tests presence alone, so a
+/// `code` holding JSON `null` or a string marks a refusal just as a number
+/// does. The reason is `data.message`, else a top-level `message`; a reply
+/// carrying neither is reported without saying why.
+///
+/// That asymmetry is the contract: a check demanding a known shape would
+/// turn any future answer from Discord into a broken connection.
 fn refusal(reply: &Value) -> Option<&str> {
     let named_error = reply.get("evt").and_then(Value::as_str) == Some("ERROR");
     let carries_code = reply
@@ -201,33 +201,34 @@ impl IpcClient {
         self.stream.is_some()
     }
 
-    /// Connects to Discord and leaves the client connected, or reports why
-    /// it could not.
+    /// Connects to Discord and leaves the client connected, or reports why it
+    /// could not.
     ///
-    /// Probes `discord-ipc-0..9` under `$XDG_RUNTIME_DIR` and the system
-    /// temp dir in order, and stops at the first candidate that both
-    /// connects ([`try_socket`]) and completes a handshake
-    /// ([`handshake`]). Only that candidate becomes the connection, so
-    /// [`is_connected`](Self::is_connected) is true afterwards only over a
-    /// socket Discord answered.
+    /// Probes `discord-ipc-0..9` under `$XDG_RUNTIME_DIR` and the system temp
+    /// dir in order, and stops at the first candidate that both connects
+    /// ([`try_socket`]) and completes a handshake ([`handshake`]). Only that
+    /// candidate becomes the connection.
     ///
     /// A candidate that answers the connection but not the handshake is
-    /// dropped and the search moves on, because a Discord that re-exports
-    /// its socket in several places serves only one of them. When the
-    /// candidates are used up the client is left disconnected — including a
-    /// connection that was open before the call, which `connect` replaces
-    /// as a whole — and the error says whether no socket was there at all
-    /// or the last one that was refused.
+    /// dropped and the search moves on. When the candidates run out the client
+    /// is left disconnected — including a connection that was open before the
+    /// call, which `connect` replaces as a whole — and the error says either
+    /// that no socket was there at all, or which candidate ended the search
+    /// and what its handshake returned — a refusal Discord stated, a hangup,
+    /// a timeout, or any other error `handshake` reports, carried as it
+    /// stands rather than summarized.
     ///
-    /// A publishing loop retries this every tick while Discord is not
-    /// running, so the error names a cause rather than an attempt, and how
-    /// often to repeat it is the caller's decision.
+    /// The error names a cause rather than an attempt, and how often to call
+    /// again is the caller's decision.
     pub fn connect(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let Some(client_id) = self.client_id else {
             self.stream = None;
             return Err(BAD_APP_ID.into());
         };
         let mut refused = None;
+        // A handshake that fails on one candidate does not end the search: a
+        // Discord that re-exports its socket in several places serves only
+        // one of them, so one answer is evidence about that candidate alone.
         for path in socket_paths() {
             let Ok(mut candidate) = try_socket(&path) else {
                 continue;
