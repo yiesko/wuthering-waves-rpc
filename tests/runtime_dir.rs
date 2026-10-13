@@ -13,11 +13,13 @@
 //! Every test runs behind [`EnvGuard`]: the process environment is global,
 //! and `XDG_RUNTIME_DIR` decides which directory the whole module uses.
 
-use std::ffi::OsString;
+use std::ffi::{CString, OsString};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, mpsc};
+use std::time::Duration;
 
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use wwrpc::runtime_dir::{
@@ -30,6 +32,11 @@ const XDG: &str = "XDG_RUNTIME_DIR";
 /// Environment variable `std::env::temp_dir()` honors. Set by the fallback
 /// tests to sandbox the shared temp dir instead of touching the real `/tmp`.
 const TMPDIR: &str = "TMPDIR";
+
+/// How long the fifo test waits for [`bounded_copy`] to answer. It only ever
+/// has to open a file and refuse it, so a generous bound still keeps a
+/// regression from being a hung suite.
+const FIFO_WAIT: Duration = Duration::from_secs(5);
 
 /// Serializes the whole file: each test reads or writes these variables,
 /// directly or through [`runtime_dir`].
@@ -618,6 +625,68 @@ fn test_bounded_copy_rejects_non_regular_source() {
         !dst.exists(),
         "a refused source must not even create the destination"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Create `path` as a fifo, whose read-only open waits for some other process
+/// to write to it instead of returning. `mkfifo(2)` is the only way to make
+/// one: safe Rust has none, and `libc` is already a dependency of this crate.
+fn make_fifo(path: &Path) {
+    let name = CString::new(path.as_os_str().as_bytes())
+        .expect("a path this file builds carries no interior nul");
+    // SAFETY: `name` is nul-terminated and outlives the call; `mkfifo` only
+    // creates the entry, and the mode keeps it as private as every other file
+    // this crate creates.
+    let rc = unsafe { libc::mkfifo(name.as_ptr(), 0o600) };
+    assert_eq!(
+        rc,
+        0,
+        "the fifo '{}' is created: {}",
+        path.display(),
+        io::Error::last_os_error()
+    );
+}
+
+/// Pins that a source that is a fifo is refused rather than waited on: opening
+/// a fifo read-only blocks until some other process opens it for writing, and
+/// a copy that waits for such a writer hangs instead of failing.
+///
+/// The call happens on its own thread and the answer is awaited with a bounded
+/// timeout, so a copy that blocks fails this test instead of the suite. The
+/// blocked thread is detached rather than joined: it would never come back.
+#[test]
+fn test_bounded_copy_refuses_a_fifo_source() {
+    let _env = EnvGuard::new();
+    let dir = scratch("fifo");
+    let src = dir.join("game.db");
+    let dst = dir.join("snap.db");
+    make_fifo(&src);
+
+    let (sender, receiver) = mpsc::channel();
+    let call_src = src.clone();
+    let call_dst = dst.clone();
+    let blocked = std::thread::spawn(move || {
+        let _ = sender.send(bounded_copy(&call_src, &call_dst, 1 << 20, DestMode::Fresh));
+    });
+
+    let outcome = receiver.recv_timeout(FIFO_WAIT).unwrap_or_else(|err| {
+        panic!(
+            "bounded_copy did not answer within {FIFO_WAIT:?} ({err}): it is \
+             blocked opening the fifo, waiting for a writer that never comes"
+        )
+    });
+
+    let err = outcome.expect_err("a fifo source must be refused");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert!(
+        err.to_string().contains("not a regular file"),
+        "the refusal must name what is wrong: {err}"
+    );
+    assert!(
+        !dst.exists(),
+        "a refused source must not even create the destination"
+    );
+    drop(blocked);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

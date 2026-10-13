@@ -264,13 +264,15 @@ pub enum DestMode {
 /// that does not belong in a snapshot.
 ///
 /// A game database is a file another process keeps writing while we read it,
-/// so the copy is bounded in three places. Every size and change measurement
-/// describes the handle the bytes came from, never the path, so a source
-/// renamed or replaced mid-copy cannot make the verdict a verdict about
-/// another file.
+/// so the copy is bounded in three places. The source is opened with
+/// `O_NONBLOCK`, so a fifo standing there hands back a handle instead of
+/// waiting for a writer, and everything said about the source afterwards —
+/// what kind of file it is, how big it is, whether it changes — describes
+/// that handle, never the path, so a source renamed or replaced mid-copy
+/// cannot make the verdict a verdict about another file.
 ///
-/// - The source is measured first, through that handle: over `limit` bytes
-///   is refused before the destination is created.
+/// - The source is judged by that handle: it must be a regular file, and
+///   over `limit` bytes is refused before the destination is created.
 /// - The bytes are then read through the same handle, in chunks that never
 ///   read past `limit`. A source with one byte too many is refused rather
 ///   than silently truncated into a corrupt snapshot.
@@ -291,43 +293,58 @@ pub enum DestMode {
 ///
 /// # Errors
 ///
-/// [`io::ErrorKind::InvalidInput`] when the source is not a regular file;
-/// [`io::ErrorKind::InvalidData`] when it is over `limit` or changed while
-/// it was copied; [`io::ErrorKind::AlreadyExists`] when [`DestMode::Fresh`]
-/// finds a destination; plus filesystem errors from measuring, opening,
-/// reading or writing either side.
+/// [`io::ErrorKind::InvalidInput`] when the source that was opened is not a
+/// regular file; [`io::ErrorKind::InvalidData`] when it is over `limit` or
+/// changed while it was copied; [`io::ErrorKind::AlreadyExists`] when
+/// [`DestMode::Fresh`] finds a destination; plus filesystem errors from
+/// measuring, opening, reading or writing either side.
 pub fn bounded_copy(src: &Path, dst: &Path, limit: u64, mode: DestMode) -> io::Result<()> {
-    // `after_measure` is the no-op below for every real caller. The crate's
-    // own tests pass one that changes the source underneath a live copy:
-    // the only way to reach the two refusals below — and to show the one
-    // case where a changing name must not matter — with no second process
-    // and no sleep between two writes.
-    bounded_copy_inner(src, dst, limit, mode, no_source_change)
+    // Both seams are no-ops for every real caller. The crate's own tests pass
+    // hooks that change the source underneath a live copy at either moment:
+    // the only way to reach the refusals below — and to show the one case
+    // where a changing name must not matter — with no second process and no
+    // sleep between two writes.
+    bounded_copy_inner(src, dst, limit, mode, no_source_change, no_source_change)
 }
 
-/// The hook [`bounded_copy`] passes: measure, copy, notice nothing.
+/// The hook [`bounded_copy`] passes to both of its seams: change the source
+/// at the named moment, or notice nothing.
 fn no_source_change(_src: &Path) {}
 
-/// The body of [`bounded_copy`], carrying the test seam.
+/// The body of [`bounded_copy`], carrying the test seams.
 ///
-/// `after_measure` runs once, after the source has been measured and before
-/// its first byte is read, so a test can change the source underneath a copy
-/// in flight and pin what happens next. Everything else is [`bounded_copy`].
+/// `before_open` runs once, before the source is opened; `after_measure` runs
+/// once, after it has been measured and before its first byte is read. A test
+/// passes hooks that put something else where the source is at either named
+/// moment: the only way to pin what a copy in flight does with a source that
+/// stops being the one it started from, with no second process and no sleep
+/// between two writes. Everything else is [`bounded_copy`].
 pub(crate) fn bounded_copy_inner(
     src: &Path,
     dst: &Path,
     limit: u64,
     mode: DestMode,
+    before_open: impl FnOnce(&Path),
     after_measure: impl FnOnce(&Path),
 ) -> io::Result<()> {
-    check_regular_file(src)?;
-    let mut source = File::open(src).map_err(|err| {
-        io::Error::new(
-            err.kind(),
-            format!("cannot open '{}': {err}", src.display()),
-        )
-    })?;
-    // Measured through the handle, not through the path: the verdict below
+    before_open(src);
+    // A fifo opened read-only blocks until some other process opens it for
+    // writing, which in a long-running daemon is a hang rather than an error.
+    // `O_NONBLOCK` takes that wait out of the open and hands back a handle
+    // that reports its own kind, so the refusal below can be asked of the
+    // handle instead of of a name the source can be replaced behind. The flag
+    // then stays on the handle for good: it means nothing to a regular file.
+    let mut source = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(src)
+        .map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("cannot open '{}': {err}", src.display()),
+            )
+        })?;
+    // Measured through the handle, not through the path: every verdict below
     // then describes the file the bytes actually come from, whatever happens
     // to the name while the copy runs.
     let before = source.metadata().map_err(|err| {
@@ -336,6 +353,12 @@ pub(crate) fn bounded_copy_inner(
             format!("cannot inspect the open '{}': {err}", src.display()),
         )
     })?;
+    if !before.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("'{}' is not a regular file", src.display()),
+        ));
+    }
     if before.len() > limit {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -365,29 +388,6 @@ pub(crate) fn bounded_copy_inner(
         return Err(err);
     }
     Ok(())
-}
-
-/// Refuse a source that is not a plain file, before the source is opened:
-/// opening a fifo blocks until a writer appears, which in a long-running
-/// daemon is a hang rather than an error.
-///
-/// How big the source is, and whether it changes, are deliberately not
-/// decided here — those are questions about the file the bytes are read from,
-/// and [`bounded_copy`] asks them of the handle it holds.
-fn check_regular_file(src: &Path) -> io::Result<()> {
-    let stat = fs::metadata(src).map_err(|err| {
-        io::Error::new(
-            err.kind(),
-            format!("cannot inspect '{}': {err}", src.display()),
-        )
-    })?;
-    if stat.is_file() {
-        return Ok(());
-    }
-    Err(io::Error::new(
-        io::ErrorKind::InvalidInput,
-        format!("'{}' is not a regular file", src.display()),
-    ))
 }
 
 /// Whether two observations of the same file agree on what a copy cares
