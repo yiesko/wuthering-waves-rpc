@@ -400,6 +400,11 @@ impl DbReader {
     /// One poll tick. Never fails hard: every problem degrades to
     /// [`Refresh::Unavailable`] (and the caller falls back to static text),
     /// except the sentinel, which degrades the reader permanently.
+    ///
+    /// A tick accepts a snapshot only with every sidecar the source keeps
+    /// beside the main database: a sidecar present at the source but refused
+    /// in the copy discards the snapshot and this tick's signature with it,
+    /// while one the source does not keep is ordinary and changes nothing.
     pub fn refresh(&mut self) -> Refresh {
         if self.degraded {
             return if self.last.is_some() {
@@ -518,23 +523,27 @@ impl DbReader {
             return self.cached_or_unavailable();
         }
         for (src, snap) in &self.sidecars {
-            // Best effort: without sidecars a torn copy cannot recover, and a
-            // source that is missing or oversized is refused before the
-            // destination is opened at all — one is not there to read, the
-            // other is measured and refused before a byte is written. A
-            // source rewritten under the copy is caught afterwards instead,
-            // and what it leaves on the destination is unlinked rather than
-            // kept. Either way the path holds this tick's copy or nothing,
-            // but only once the leftover a killed run left has been cleared,
-            // which is what the removal below does first. Skipping it would
-            // leave a `-journal` in place: not inert data beside a database,
-            // since SQLite reads one as a hot journal and rolls the pages it
-            // holds back into the copy made a moment ago. A removal that
-            // itself fails is warned about rather than made fatal — the next
-            // tick tries again, while refusing the snapshot would cost the
-            // reader's data for the whole session.
+            // A refused sidecar is either absent or incomplete, and only the
+            // path's own error tells them apart: a refusal carrying `NotFound`
+            // is taken as the game keeping no such file, which is ordinary in
+            // rollback-journal mode. Any other refusal leaves a file at the
+            // source out of the snapshot, so the set would mix two instants
+            // and a WAL commit would lose the rows still in the log — the
+            // snapshot goes, and the signature with it, so the next tick
+            // measures the same state and tries the copy again. The
+            // destination is cleared first either way, so a journal a killed
+            // run left behind cannot replay into the copy made a moment ago.
             Self::remove_before_copy(snap);
-            let _ = bounded_copy(src, snap, MAX_DB_BYTES, DestMode::Overwrite);
+            if let Err(err) = bounded_copy(src, snap, MAX_DB_BYTES, DestMode::Overwrite)
+                && err.kind() != io::ErrorKind::NotFound
+            {
+                log::debug("sidecar copy refused; discarding incomplete snapshot");
+                Self::remove_quiet(&self.snap_db);
+                for (_, snap) in &self.sidecars {
+                    Self::remove_quiet(snap);
+                }
+                return self.cached_or_unavailable();
+            }
         }
 
         // Discard torn copies: the game must not have touched the source while

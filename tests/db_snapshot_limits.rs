@@ -28,13 +28,14 @@
 //! be opened with a leftover beside it. Clearing one is best effort: an entry
 //! the tick cannot remove costs it that tick's data, never the session.
 
-use std::fs::{self, File};
+use std::fs::{self, File, FileTimes};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
 
 use rusqlite::Connection;
 
-use wwrpc::db::{DbReader, MAX_DB_BYTES, MAX_JSON_BYTES, Refresh, TriageError};
+use wwrpc::db::{DbReader, MAX_DB_BYTES, MAX_JSON_BYTES, Refresh, TriageError, snapshot_signature};
 use wwrpc::runtime_dir::runtime_dir;
 
 /// Prefix of every fixture directory this file creates.
@@ -610,6 +611,108 @@ fn test_tick_clears_a_leftover_snapshot_sidecar() {
     assert!(
         !leftover.exists(),
         "the leftover must not outlive the tick that refused to replace it"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Pins that a sidecar present at the source but refused in the copy
+/// invalidates the whole snapshot. A tick that copied the main database
+/// while its `-wal` stayed behind would otherwise publish the rows the log
+/// still held without, accept that tick's signature, and serve the partial
+/// snapshot until the source moves again.
+///
+/// The refused sidecar is a directory: the same non-regular refusal a file
+/// over the ceiling or rewritten mid-copy takes, without writing tens of
+/// megabytes to reach it. The main database is moved to a new level first,
+/// so an accepted partial snapshot would publish that level and a discarded
+/// one keeps the previous data. A second tick under the same source state
+/// must still hold the old data rather than sit on an accepted signature.
+#[test]
+fn test_a_sidecar_present_but_refused_discards_the_snapshot() {
+    let root = fixture("refused-sidecar");
+    let storage = root.join("Client/Saved/LocalStorage");
+    fs::create_dir_all(&storage).expect("the storage dir is created");
+    let live = storage.join("LocalStorage.db");
+    write_account_db(&live);
+    let snap = root.join("snapshots");
+
+    let mut reader = DbReader::new(storage.clone(), snap.clone(), None).expect("the reader opens");
+    assert_eq!(
+        reader.refresh(),
+        Refresh::Updated,
+        "the first tick copies and triages an ordinary database"
+    );
+    assert_eq!(
+        reader
+            .last_info()
+            .expect("the first tick triages the account")
+            .union_level,
+        "60"
+    );
+    let accepted = snapshot_signature(&storage).expect("the storage dir is measurable");
+
+    Connection::open(&live)
+        .expect("the fixture database opens")
+        .execute(
+            "UPDATE LocalStorage SET value = ?1 WHERE key = 'SdkLevelData'",
+            [format!(
+                r#"{{"Content": [["{LIVE_UID}", [{{"Region": "Europe", "Level": 61}}]]]}}"#
+            )],
+        )
+        .expect("the level row is raised");
+    let later = fs::metadata(&live)
+        .and_then(|meta| meta.modified())
+        .expect("the fixture database has a modification time")
+        + Duration::from_secs(60);
+    File::options()
+        .write(true)
+        .open(&live)
+        .expect("the fixture database is writable")
+        .set_times(FileTimes::new().set_modified(later))
+        .expect("the fixture database is stamped");
+    fs::create_dir(storage.join("LocalStorage.db-wal"))
+        .expect("the un-copyable sidecar is planted");
+    assert_ne!(
+        snapshot_signature(&storage).expect("the storage dir is measurable"),
+        accepted,
+        "the fixture must change the set, or the ticks below prove nothing"
+    );
+
+    assert_eq!(
+        reader.refresh(),
+        Refresh::Unchanged,
+        "a sidecar that could not be copied must hold the tick at its last data"
+    );
+    assert_eq!(
+        reader
+            .last_info()
+            .expect("the first tick's data is still standing")
+            .union_level,
+        "60",
+        "the partial snapshot must not publish the level it copied without its sidecar"
+    );
+    assert!(
+        !snap.join("snapshot.db").exists(),
+        "the discarded main copy must not outlive the tick that refused it"
+    );
+    assert!(
+        !snap.join("snapshot.db-wal").exists(),
+        "the refused sidecar must leave nothing behind either"
+    );
+
+    assert_eq!(
+        reader.refresh(),
+        Refresh::Unchanged,
+        "the same source state must try again rather than sit on an accepted signature"
+    );
+    assert_eq!(
+        reader
+            .last_info()
+            .expect("the first tick's data is still standing")
+            .union_level,
+        "60",
+        "a signature accepted from a partial snapshot would serve the new level here"
     );
 
     let _ = fs::remove_dir_all(&root);
