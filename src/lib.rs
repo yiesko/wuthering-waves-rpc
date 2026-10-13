@@ -90,7 +90,7 @@ const OFFICIAL_APP_ID: &str = "1247227126416146462";
 /// Sleep slice: Ctrl+C stays responsive without busy-waiting.
 const SLEEP_SLICE: Duration = Duration::from_millis(250);
 
-/// Whether the publishing loop should keep going. The Ctrl+C handler
+/// Whether the publishing loop should keep going. The signal handler
 /// clears it and the loop checks it between ticks, so a signal ends the
 /// run the same way an exhausted loop does — through the code that clears
 /// our presence on the way out.
@@ -220,11 +220,20 @@ pub fn needs_game_data(args: &Args) -> bool {
     !args.no_database || args.list_accounts || args.print_activity
 }
 
-/// Install the Ctrl+C handler.
+/// Installs the handler that turns a termination signal into the end of a
+/// run.
 ///
-/// The signal only asks the publishing loop to stop; the run then
-/// finishes the tick it is in and returns, which is what clears our
-/// presence on the way out.
+/// It covers SIGINT (Ctrl+C), SIGTERM and SIGHUP. SIGTERM is what
+/// `systemctl --user stop` sends, so stopping the unit ends the run the
+/// same graceful way an interactive Ctrl+C does. The handler clears the
+/// run flag the publishing loop checks between ticks and does nothing
+/// else: it publishes nothing and clears no presence itself, because the
+/// loop is the only thing that knows which pid it published under.
+///
+/// Fails when the operating system refuses the signal registration, when
+/// the thread that runs the handler cannot start, or when this process has
+/// already registered a handler — a handler installed elsewhere is
+/// replaced, but a second registration of our own is rejected.
 pub fn install_signal_handler() -> Result<(), Box<dyn Error>> {
     ctrlc::set_handler(|| RUNNING.store(false, Ordering::SeqCst))?;
     Ok(())
