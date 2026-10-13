@@ -6,6 +6,7 @@ mod db;
 mod detect;
 mod gating;
 mod ipc;
+mod listing;
 mod log;
 mod presence;
 mod runtime_dir;

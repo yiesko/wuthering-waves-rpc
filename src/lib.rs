@@ -70,7 +70,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 
 use crate::character::Character;
-use crate::db::{DbReader, Refresh};
+use crate::db::{DbReader, Refresh, StoredAccount};
 use crate::detect::{Detector, process_start_millis};
 use crate::ipc::IpcClient;
 use crate::lock::SingleInstance;
@@ -324,8 +324,8 @@ fn print_characters() {
 }
 
 /// Print the stored accounts, in file order, as `N: Region, Union LEVEL`.
-/// Login nicknames are shown in parentheses when locatable; uids never
-/// leave the reader.
+/// Login nicknames are shown in parentheses when locatable, masked to at
+/// most their two ends; uids never leave the reader.
 fn print_accounts(game_dir: &Path, storage_dir: &Path) -> Result<(), Box<dyn Error>> {
     let accounts = DbReader::list_accounts(storage_dir, game_dir)?;
     if accounts.is_empty() {
@@ -333,27 +333,81 @@ fn print_accounts(game_dir: &Path, storage_dir: &Path) -> Result<(), Box<dyn Err
         return Ok(());
     }
     for account in &accounts {
-        let marker = if account.last_login {
-            " [last launcher login]"
-        } else {
-            ""
-        };
-        match account.nickname.as_deref() {
-            // Login nickname: recognition aid, may be outdated — never used
-            // for matching or display.
-            Some(nickname) => println!(
-                "{}: {}, Union {} (login nickname: {nickname}?){marker}",
-                account.index, account.region, account.level
-            ),
-            None => println!(
-                "{}: {}, Union {}{marker}",
-                account.index, account.region, account.level
-            ),
-        }
+        println!("{}", account_line(account));
     }
-    println!("Nicknames in () are login nicknames and may be outdated;");
-    println!("recognize yours by region/level, then pin it with --account-index N.");
+    println!("Nicknames in () are login nicknames, may be outdated, and are shown");
+    println!("masked to at most their first and last character; recognize yours by");
+    println!("region/level, then pin it with --account-index N.");
     Ok(())
+}
+
+/// One stored account rendered for the listing: `N: Region, Union LEVEL`,
+/// the login nickname in parentheses when the row has one, and the
+/// last-login marker when the row carries it.
+///
+/// What this guarantees is the contract of a printed row. The index
+/// leads, because it is the value the reader types into
+/// `--account-index N`. A nickname reaches the line only through
+/// [`mask_name`], so a row carries the name in full only where the mask
+/// hides nothing but stars — a name the mask's own marker already spells.
+/// A row with no nickname carries no parentheses at all.
+///
+/// It formats and nothing more: it reads no file, opens no socket, and
+/// the caller decides what becomes of the string.
+fn account_line(account: &StoredAccount) -> String {
+    let marker = if account.last_login {
+        " [last launcher login]"
+    } else {
+        ""
+    };
+    match account.nickname.as_deref() {
+        // Login nickname: recognition aid, may be outdated — never used
+        // for matching, and printed masked to at most its first and last
+        // character.
+        Some(nickname) => format!(
+            "{}: {}, Union {} (login nickname: {}?){marker}",
+            account.index,
+            account.region,
+            account.level,
+            mask_name(nickname)
+        ),
+        None => format!(
+            "{}: {}, Union {}{marker}",
+            account.index, account.region, account.level
+        ),
+    }
+}
+
+/// Mask a name for printing: first character, last character, and one `*`
+/// for every character between.
+///
+/// A listing is meant to be pasted into a bug report, so the whole name
+/// does not have to be what lands on the screen: the two ends recognise
+/// a name the reader already knows, and carry nothing else.
+///
+/// A name of one or two characters keeps neither end — masking both
+/// would print it in full — so it is starred out entirely. An empty name
+/// stays empty.
+///
+/// Characters are counted, never bytes, so a name written in any script
+/// keeps its first and last character instead of being cut mid-letter.
+///
+/// What this does not hide: the name's length, which the mask matches
+/// character for character, and the name itself for anyone who has it.
+fn mask_name(name: &str) -> String {
+    let characters = name.chars().count();
+    if characters <= 2 {
+        return "*".repeat(characters);
+    }
+    let mut masked = String::with_capacity(name.len());
+    for (position, character) in name.chars().enumerate() {
+        masked.push(if position == 0 || position + 1 == characters {
+            character
+        } else {
+            '*'
+        });
+    }
+    masked
 }
 
 /// Print the activity a tick would publish right now, then exit: a dry
