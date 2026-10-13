@@ -736,3 +736,63 @@ fn test_the_remnant_scan_is_not_redone_for_an_unchanged_file() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+/// Pins that a SQLite failure is not an answer: unreadable bytes make the
+/// prepare fail, and that miss must not be kept like a real one.
+///
+/// The first version of the file is unreadable bytes of the same length as
+/// the second, with the timestamp put back after the rewrite, so the two
+/// are one version to the cache. Only a lookup that ran again could find
+/// the name the second version holds.
+#[test]
+fn test_a_sqlite_failure_is_not_cached_as_a_miss() {
+    let root = steam_tree("sqlite-miss");
+    let account = storage_of(&root).join("LocalStorage.db");
+    write_account_db(&account, LIVE_UID, &[LIVE_UID]);
+    let telemetry = telemetry_of(&root);
+    // The length of a real telemetry database, so the unreadable version
+    // below is the same length and the pair is one signature to the cache.
+    write_telemetry_db(&telemetry, &[(LIVE_UID, "RoverOne")]);
+    let len = fs::metadata(&telemetry)
+        .expect("the telemetry file is measurable")
+        .len();
+    fs::write(&telemetry, vec![b'X'; len as usize]).expect("the garbage fixture is written");
+    let before = file_signature(&telemetry).expect("the telemetry file is measurable");
+    let before_time = written_at(&telemetry);
+
+    let mut reader = reader_over(&root, "sqlite-miss");
+    assert_eq!(
+        reader.refresh(),
+        Refresh::Updated,
+        "triage passes while the telemetry file is unreadable"
+    );
+    assert_eq!(
+        reader.display_name(),
+        None,
+        "unreadable bytes hold no name, so there is none yet"
+    );
+
+    write_telemetry_db(&telemetry, &[(LIVE_UID, "RoverOne")]);
+    restore_time(&telemetry, before_time);
+    assert_eq!(
+        file_signature(&telemetry).expect("the telemetry file is measurable"),
+        before,
+        "the two versions must be the same length and time, or this fixture \
+         says nothing: the reader is allowed to re-read a file that changed"
+    );
+    touch(&account);
+
+    assert_eq!(
+        reader.refresh(),
+        Refresh::Updated,
+        "the account database moved on, so the tick still triages"
+    );
+    assert_eq!(
+        reader.display_name(),
+        Some("RoverOne"),
+        "the file never changed version, but the read did fail: nothing was \
+         learned, so the next tick must try the file again"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}

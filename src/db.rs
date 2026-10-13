@@ -858,10 +858,12 @@ impl DbReader {
     /// login, deleted after upload), so absence is normal and never an
     /// error.
     ///
-    /// [`Lookup::Unread`] wherever the copy did not happen or did not come
-    /// back — nowhere to put it, or a copy that was refused. Only a file
-    /// that was actually read answers, empty or not, so a failure costs the
-    /// next tick another try instead of freezing the name as missing.
+    /// [`Lookup::Unread`] wherever the copy did not happen, did not come
+    /// back, or did not read: nowhere to put it, a copy that was refused,
+    /// or a database that cannot be opened, prepared or queried. Only a
+    /// file that was actually read answers, empty or not, so a failure
+    /// costs the next tick another try instead of freezing the name as
+    /// missing.
     ///
     /// Free-standing rather than a method because the caller holds the cache
     /// mutably; it needs the source file and a scratch directory, nothing more.
@@ -876,9 +878,9 @@ impl DbReader {
         if bounded_copy(kd_src, &snap_copy, MAX_DB_BYTES, DestMode::Overwrite).is_err() {
             return Lookup::Unread;
         }
-        let name = query_kd_names(&snap_copy, role_uid);
+        let answer = query_kd_names(&snap_copy, role_uid);
         DbReader::remove_quiet(&snap_copy);
-        Lookup::Answered(name)
+        answer
     }
 
     /// Identity recovery for one login uid from a PRIVATE copy of the
@@ -1245,18 +1247,32 @@ fn time_from_nanos(nanos: i128) -> SystemTime {
 }
 
 /// Display name for one login uid from a PRIVATE telemetry copy: exact
-/// `role_id` match over live `KDData` rows. First match wins; names are
-/// sanity-checked (1–[`MAX_NAME_CHARS`] characters, no control characters)
-/// because they come from an external writer. Anything off — missing table,
-/// bad rows, absent uid — yields `None`, never an error.
-pub(crate) fn query_kd_names(snap: &Path, role_uid: &str) -> Option<String> {
-    let conn = rusqlite::Connection::open(snap).ok()?;
-    let mut stmt = conn.prepare("SELECT content FROM KDData LIMIT ?1").ok()?;
-    let rows = stmt
-        .query_map([i64::try_from(MAX_ROWS).unwrap_or(i64::MAX)], |row| {
-            row.get::<_, String>(0)
-        })
-        .ok()?;
+/// `role_id` match over live `KDData` rows. First sane match wins; names
+/// are sanity-checked (1–[`MAX_NAME_CHARS`] characters, no control
+/// characters) because they come from an external writer.
+///
+/// A file that could not be read answers [`Lookup::Unread`]: a database
+/// that cannot be opened, a statement that cannot be prepared, or rows that
+/// cannot be queried. Nothing was learned, so the caller tries the file
+/// again rather than keeping the miss.
+///
+/// A search that ran answers [`Lookup::Answered`]: the first name that
+/// passes the checks, or [`None`] when no row does. A row that is missing
+/// its identifiers, carries an unusable name, or is not JSON at all is
+/// skipped where it stands and never fails the search around it. Values
+/// never reach a log or an error string.
+pub(crate) fn query_kd_names(snap: &Path, role_uid: &str) -> Lookup<String> {
+    let Ok(conn) = rusqlite::Connection::open(snap) else {
+        return Lookup::Unread;
+    };
+    let Ok(mut stmt) = conn.prepare("SELECT content FROM KDData LIMIT ?1") else {
+        return Lookup::Unread;
+    };
+    let Ok(rows) = stmt.query_map([i64::try_from(MAX_ROWS).unwrap_or(i64::MAX)], |row| {
+        row.get::<_, String>(0)
+    }) else {
+        return Lookup::Unread;
+    };
     for cell in rows.flatten() {
         let Ok(value) = serde_json::from_str::<Value>(&cell) else {
             continue;
@@ -1277,10 +1293,10 @@ pub(crate) fn query_kd_names(snap: &Path, role_uid: &str) -> Option<String> {
         let name = name.trim().to_string();
         if !name.is_empty() && within(&name, MAX_NAME_CHARS) && !name.chars().any(char::is_control)
         {
-            return Some(name);
+            return Lookup::Answered(Some(name));
         }
     }
-    None
+    Lookup::Answered(None)
 }
 
 /// A login-role identity recovered from launcher-telemetry remnants:

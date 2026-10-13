@@ -873,21 +873,25 @@ fn query_kd_names_matches_exact_live_rows_only() {
     );
     // First exact match wins; other uids, malformed rows and garbage pass by.
     assert_eq!(
-        crate::db::query_kd_names(&path, "111111111").as_deref(),
-        Some("First")
+        crate::db::query_kd_names(&path, "111111111"),
+        crate::telemetry_cache::Lookup::Answered(Some("First".to_string()))
     );
     assert_eq!(
-        crate::db::query_kd_names(&path, "222222222").as_deref(),
-        Some("Al")
+        crate::db::query_kd_names(&path, "222222222"),
+        crate::telemetry_cache::Lookup::Answered(Some("Al".to_string()))
     );
     assert_eq!(
-        crate::db::query_kd_names(&path, "555555555").as_deref(),
-        Some("Numeric")
+        crate::db::query_kd_names(&path, "555555555"),
+        crate::telemetry_cache::Lookup::Answered(Some("Numeric".to_string()))
     );
-    assert_eq!(crate::db::query_kd_names(&path, "999999999"), None);
+    assert_eq!(
+        crate::db::query_kd_names(&path, "999999999"),
+        crate::telemetry_cache::Lookup::Answered(None)
+    );
     let _ = fs::remove_dir_all(path.parent().unwrap());
 
-    // Missing table or file: None, never an error.
+    // A search that ran answers, even when it found nothing; a file that
+    // could not be read does not.
     let empty_dir = unique_dir("kd-empty");
     let _ = fs::remove_dir_all(&empty_dir);
     fs::create_dir_all(&empty_dir).unwrap();
@@ -896,10 +900,19 @@ fn query_kd_names_matches_exact_live_rows_only() {
         .unwrap()
         .execute_batch("CREATE TABLE KDData (id INTEGER PRIMARY KEY)")
         .unwrap();
-    assert_eq!(crate::db::query_kd_names(&empty, "111111111"), None);
+    assert_eq!(
+        crate::db::query_kd_names(&empty, "111111111"),
+        crate::telemetry_cache::Lookup::Unread
+    );
     assert_eq!(
         crate::db::query_kd_names(&empty_dir.join("missing.db"), "111111111"),
-        None
+        crate::telemetry_cache::Lookup::Unread
+    );
+    let garbage = empty_dir.join("garbage.db");
+    fs::write(&garbage, b"not a database at all").unwrap();
+    assert_eq!(
+        crate::db::query_kd_names(&garbage, "111111111"),
+        crate::telemetry_cache::Lookup::Unread
     );
     let _ = fs::remove_dir_all(&empty_dir);
 }
