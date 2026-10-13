@@ -490,6 +490,13 @@ impl DbReader {
         };
 
         if self.last_signature == Some(signature) && self.last.is_some() {
+            // The source was measured and only turned out unchanged, so this
+            // tick is healthy: it clears the warning record exactly as an
+            // accepted snapshot does, or a fault that cleared and returns
+            // would compare equal to the stale record and stay silent. Ticks
+            // that never measured the source keep the record, so a fault
+            // that persists still warns once.
+            self.last_reported = None;
             log::debug("snapshot unchanged since last tick; reusing data");
             return Refresh::Unchanged;
         }

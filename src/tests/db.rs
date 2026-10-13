@@ -1210,3 +1210,116 @@ fn remnant_scan_resolves_each_hit_against_its_nearest_marker() {
         }
     );
 }
+
+/// A tick that measures the source and finds it unchanged re-arms the warning.
+///
+/// The fault here clears without rewriting any measured file: locking the
+/// directory that holds the linked sidecar hides it, unlocking restores the
+/// same fold, so the middle tick takes the unchanged early return instead of
+/// the success path. Only that return clearing the record lets the fault
+/// coming back warn a second time. Ticks that never measure the source keep
+/// the record, so a fault that persists still costs exactly one line.
+///
+/// The link matters: locking the database directory itself would hide the
+/// main file too, which fails earlier and silently. The mode is restored by
+/// a guard on every exit. Each lock is checked rather than assumed: a runner
+/// the lock does not block cannot stage this fault, so the test returns
+/// there instead of asserting on a condition it never built.
+#[test]
+fn unchanged_tick_rearms_the_signature_warning() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    /// Restores a directory's mode on drop, so a locked directory never
+    /// escapes the test, whatever path leaves it.
+    struct ModeRestore {
+        dir: std::path::PathBuf,
+    }
+    impl Drop for ModeRestore {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    fn lock(dir: &std::path::Path) {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o000)).unwrap();
+    }
+
+    fn unlock(dir: &std::path::Path) {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let storage = storage_with_sql("latch-unchanged", &[VALID_SCHEMA, UID_ROW, SDK_ROW]);
+    let snap = unique_dir("latch-unchanged-snap");
+    let mut reader = DbReader::new(storage.clone(), snap.clone(), None).unwrap();
+
+    // The sidecar is a link into a second directory, so locking that
+    // directory hides the sidecar while the main database stays readable.
+    // Only the directory's mode moves, never a measured file, so unlocking
+    // restores the accepted fold exactly.
+    let outer = unique_dir("latch-unchanged-outer");
+    let _ = fs::remove_dir_all(&outer);
+    fs::create_dir_all(&outer).unwrap();
+    let target = outer.join("wal-target");
+    fs::write(&target, b"write-ahead log stand-in").unwrap();
+    let wal = storage.join("LocalStorage.db-wal");
+    std::os::unix::fs::symlink(&target, &wal).unwrap();
+    let _mode_guard = ModeRestore { dir: outer.clone() };
+
+    assert_eq!(reader.refresh(), Refresh::Updated);
+    assert_eq!(reader.last_warning(), None);
+    assert_eq!(reader.signature_warnings(), 0);
+
+    lock(&outer);
+    if fs::metadata(&wal).is_ok() {
+        // The lock does not block this runner, so the fault cannot be
+        // staged here and there is nothing to pin on it.
+        unlock(&outer);
+        let _ = fs::remove_file(&wal);
+        let _ = fs::remove_dir_all(&storage);
+        let _ = fs::remove_dir_all(&snap);
+        let _ = fs::remove_dir_all(&outer);
+        return;
+    }
+    assert_eq!(reader.refresh(), Refresh::Unchanged);
+    assert_eq!(reader.last_warning(), Some("signature"));
+    assert_eq!(reader.signature_warnings(), 1);
+    // A fault that never left warns once, however many ticks it spans.
+    assert_eq!(reader.refresh(), Refresh::Unchanged);
+    assert_eq!(reader.signature_warnings(), 1);
+
+    unlock(&outer);
+    assert!(
+        fs::metadata(&wal).is_ok(),
+        "restoring the mode must make the linked sidecar readable again"
+    );
+    assert_eq!(
+        reader.refresh(),
+        Refresh::Unchanged,
+        "the restored fold equals the accepted one, so no re-read happens"
+    );
+    assert_eq!(reader.signature_warnings(), 1);
+    let rearmed = reader.last_warning().is_none();
+
+    lock(&outer);
+    assert!(
+        fs::metadata(&wal).is_err(),
+        "a locked holding directory must hide the linked sidecar"
+    );
+    assert_eq!(reader.refresh(), Refresh::Unchanged);
+    assert!(
+        rearmed,
+        "the unchanged tick must clear the record, or a returning fault reads as the old one"
+    );
+    assert_eq!(reader.last_warning(), Some("signature"));
+    assert_eq!(
+        reader.signature_warnings(),
+        2,
+        "a fault that cleared and returned is a new condition, not the old one"
+    );
+
+    unlock(&outer);
+    let _ = fs::remove_file(&wal);
+    let _ = fs::remove_dir_all(&storage);
+    let _ = fs::remove_dir_all(&snap);
+    let _ = fs::remove_dir_all(&outer);
+}
