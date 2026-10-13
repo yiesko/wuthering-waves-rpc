@@ -717,3 +717,64 @@ fn test_a_sidecar_present_but_refused_discards_the_snapshot() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+/// Pins that a one-shot listing fails when a sidecar present at the
+/// source cannot be copied. Serving the snapshot without that file
+/// would mix two instants: rows still sitting in the log would be
+/// missing from the accounts the listing prints, with no later tick
+/// to repair the answer. A listing is one-shot, so the caller retries
+/// the command instead.
+///
+/// The refused sidecar is a directory: the same non-regular refusal a
+/// file over the ceiling takes, without growing a fixture past it.
+#[test]
+fn test_listing_fails_when_sidecar_present_but_refused() {
+    let _lock = list_lock();
+    let root = fixture("listing-sidecar");
+    let storage = root.join("Client/Saved/LocalStorage");
+    fs::create_dir_all(&storage).expect("the storage dir is created");
+    write_account_db(&storage.join("LocalStorage.db"));
+    fs::create_dir(storage.join("LocalStorage.db-wal"))
+        .expect("the un-copyable sidecar is planted");
+
+    let err = DbReader::list_accounts(&storage, &storage)
+        .expect_err("a present-but-refused sidecar must fail the listing");
+
+    assert_eq!(err, TriageError::Unopenable);
+    assert!(
+        list_dirs().is_empty(),
+        "the failed listing must not leave its scratch dir behind"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Pins the other half of that contract: sidecars the game keeps no
+/// copy of are the ordinary rollback-journal state, not a fault, so a
+/// listing with none beside the database still comes back with every
+/// account it triaged.
+#[test]
+fn test_listing_succeeds_when_sidecars_absent() {
+    let _lock = list_lock();
+    let root = fixture("listing-no-sidecar");
+    let storage = root.join("Client/Saved/LocalStorage");
+    fs::create_dir_all(&storage).expect("the storage dir is created");
+    write_account_db(&storage.join("LocalStorage.db"));
+    assert!(
+        !storage.join("LocalStorage.db-journal").exists()
+            && !storage.join("LocalStorage.db-wal").exists()
+            && !storage.join("LocalStorage.db-shm").exists(),
+        "the fixture must hold no sidecar, or the listing below proves nothing"
+    );
+
+    let listed = DbReader::list_accounts(&storage, &storage).expect("the listing itself works");
+
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        listed[0].region, "Europe",
+        "the account the listing came for is still there"
+    );
+    assert_eq!(listed[0].level, "60");
+
+    let _ = fs::remove_dir_all(&root);
+}

@@ -1010,14 +1010,24 @@ impl DbReader {
         .map_err(|_| TriageError::Unopenable)?;
         if let Some(snap_dir) = snap_db.parent() {
             for suffix in SIDECAR_SUFFIXES {
-                // Best effort, exactly as on the per-tick path: recovery
-                // data is a bonus, never a reason to fail a listing.
-                let _ = bounded_copy(
+                // A refused sidecar is either absent or incomplete, and only
+                // the error tells them apart: a refusal carrying `NotFound`
+                // is the game keeping no such file, ordinary in
+                // rollback-journal mode. Any other refusal leaves a file at
+                // the source out of the snapshot, so the set would mix two
+                // instants and the listing would serve rows the log still
+                // holds without. The call fails instead, through the same
+                // channel as a refused main copy; a listing is one-shot, so
+                // the user retries the command.
+                if let Err(err) = bounded_copy(
                     &storage_dir.join(format!("{MAIN_DB}{suffix}")),
                     &snap_dir.join(format!("snapshot.db{suffix}")),
                     MAX_DB_BYTES,
                     DestMode::Fresh,
-                );
+                ) && err.kind() != io::ErrorKind::NotFound
+                {
+                    return Err(TriageError::Unopenable);
+                }
             }
         }
         let conn = rusqlite::Connection::open(snap_db).map_err(|_| TriageError::Unopenable)?;
