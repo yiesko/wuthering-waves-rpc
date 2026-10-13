@@ -15,7 +15,10 @@
 //!
 //! - Directories are `0700` and files `0600`, set after creation because a
 //!   umask can only clear bits, and a strict one would otherwise leave the
-//!   new path unusable.
+//!   new path unusable. A base that has to be rebuilt gets the same
+//!   treatment, one level at a time: every level of the chain that walk
+//!   creates is pinned, and every level of it that was already there is
+//!   left as it is.
 //! - `$XDG_RUNTIME_DIR` is honored only when it is absolute and non-empty;
 //!   anything else falls back to the system temp dir with a warning, under
 //!   the name `wwrpc-<uid>`.
@@ -86,6 +89,13 @@ const COPY_BUFFER: usize = 64 * 1024;
 /// refused, while a directory we own is repaired to mode `0700` when the
 /// mode drifted.
 ///
+/// A missing base — a `XDG_RUNTIME_DIR` left behind by a login manager that
+/// is gone — is rebuilt one level at a time, each new level pinned to
+/// `0700` before the next is created under it, so a strict umask cannot
+/// leave one of them unusable. Levels of that base that already exist are
+/// not part of the repair: their permissions belong to whoever set them and
+/// stay untouched.
+///
 /// # Errors
 ///
 /// Filesystem errors while creating or inspecting the entry, plus a
@@ -102,7 +112,7 @@ pub fn runtime_dir() -> io::Result<PathBuf> {
         // the exclusive create is retried.
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             let base = base.path();
-            fs::create_dir_all(base).map_err(|err| {
+            create_private_dir_chain(base).map_err(|err| {
                 io::Error::new(
                     err.kind(),
                     format!("cannot create runtime base '{}': {err}", base.display()),
@@ -506,6 +516,39 @@ fn create_private_dir(path: &Path) -> io::Result<()> {
         })?;
     // mkdir's mode is masked by the umask; enforce the exact value.
     set_mode(path, DIR_MODE)
+}
+
+/// Create every component of `base` that is missing, each as a private
+/// (`0700`) directory through the exclusive `mkdir` of
+/// [`create_private_dir`], and skip every component that already exists.
+///
+/// What `Ok(())` promises is only that every level of `base` was either
+/// there already or was created here — not that `base` is now a usable
+/// directory. A level that is a file, or a symlink to nowhere, is left
+/// exactly as it is, so it can pass this walk and still refuse the `wwrpc`
+/// entry [`runtime_dir`] creates next. That entry is what proves the base
+/// is usable, not this call.
+fn create_private_dir_chain(base: &Path) -> io::Result<()> {
+    // Each level is pinned before the walk descends: `mkdir` takes its mode
+    // through the umask, so a strict one leaves the level just created
+    // without its search bit, and the next `mkdir` under it fails with
+    // `EACCES` long before that level could be repaired.
+    //
+    // `components` yields the root first for an absolute path and nothing
+    // at all for an empty one, so `prefix` is a real, resolvable path at
+    // every step of the descent.
+    let mut prefix = PathBuf::new();
+    for component in base.components() {
+        prefix.push(component);
+        match create_private_dir(&prefix) {
+            Ok(()) => {}
+            // `mkdir` refused an entry that was already there: this code
+            // created nothing here and has no say over its permissions.
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
 }
 
 /// Open the destination for writing without ever following a symlink.

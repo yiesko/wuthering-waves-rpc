@@ -361,8 +361,6 @@ fn test_runtime_dir_repairs_mode_drift() {
 #[test]
 fn test_runtime_dir_rebuilds_missing_base() {
     let env = EnvGuard::new();
-    // Two levels below the fixture: `create_dir_all` has to walk the whole
-    // tree, not stop at the first missing component.
     let root = fixture("stale");
     let base = root.join("missing").join("root");
     let _ = std::fs::remove_dir_all(&root);
