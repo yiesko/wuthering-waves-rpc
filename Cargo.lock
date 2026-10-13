@@ -2024,6 +2024,7 @@ dependencies = [
  "rsrpc-core",
  "rsrpc-detect",
  "rusqlite",
+ "serde",
  "serde_json",
  "ureq",
 ]

@@ -1,10 +1,11 @@
 use std::fs;
 
 use crate::db::{
-    DbReader, MAX_REMANT_AGE_MS, Refresh, TriageError, check_integrity, check_schema,
-    discover_game_dir, find_remnant_role, has_account_data, is_numbered_db, load_sdk_level,
-    load_sdk_level_by_index, load_uid, parse_account_list, parse_quest_count, parse_sdk_level_data,
-    resolve_storage, resolve_storage_dir,
+    DbReader, MAX_REMANT_AGE_MS, Refresh, RemnantStats, TriageError, accepted_message,
+    check_integrity, check_schema, discover_game_dir, find_remnant_role, has_account_data,
+    is_numbered_db, load_sdk_level, load_sdk_level_by_index, load_uid, missing_level_message,
+    parse_account_list, parse_quest_count, parse_sdk_level_data, recovered_message,
+    resolve_storage, resolve_storage_dir, scan_census_message,
 };
 
 const SDK_BODY: &str = r#"{
@@ -101,7 +102,7 @@ fn quest_count_counts_entries_per_uid() {
 }
 
 #[test]
-fn refresh_reads_copy_and_caches_by_mtime() {
+fn refresh_reads_copy_and_caches_by_signature() {
     let storage = make_storage("basic", "111111111", "Europe", 60);
     let snap = unique_dir("basic-snap");
     let mut reader = DbReader::new(storage.clone(), snap.clone(), None).unwrap();
@@ -109,10 +110,10 @@ fn refresh_reads_copy_and_caches_by_mtime() {
     assert_eq!(reader.refresh(), Refresh::Updated);
     assert_eq!(reader.last_info().unwrap().union_level, "60".to_string());
     assert_eq!(reader.last_info().unwrap().region, "Europe".to_string());
-    // No snapshot leftovers: the RAM copy is deleted after each read.
+    // No snapshot leftovers: the private copy is deleted after each read.
     assert!(!snap.join("snapshot.db").exists());
 
-    // Unchanged file: no re-read.
+    // Nothing the snapshot is built from was written: no re-read.
     assert_eq!(reader.refresh(), Refresh::Unchanged);
 
     let _ = fs::remove_dir_all(&storage);
@@ -326,6 +327,110 @@ fn triage_failure_is_tracked_and_hints_stay_generic() {
     let _ = fs::remove_dir_all(&snap);
 }
 
+/// Pins that a sidecar which cannot be measured is LOUD once — not once per
+/// tick, and not once ever.
+///
+/// A tick that cannot take its signature keeps its data and carries on,
+/// which is right: nothing is refused, and the condition usually clears by
+/// itself. But a condition that persists then holds the presence at its
+/// last value for the rest of the session, and the warning is the only
+/// thing that tells a reader of the log so. So the warning must exist, and
+/// it must be deduplicated: one line while the fault is still there, and a
+/// fresh one if it clears and returns, because by then the situation has
+/// changed and the earlier line is stale.
+///
+/// What is asserted is both halves of "once". The record (`last_warning`)
+/// says which fault the reader is holding, and the count
+/// (`signature_warnings`) says how many lines it has actually printed —
+/// the count is what a record-only test cannot reach, since the record
+/// reads the same whether the first tick printed or the fifth did. The
+/// lines themselves go to the process's stderr, which a test cannot read,
+/// so the count is kept beside the emission. Lives here rather than in
+/// `tests/` because both accessors are crate-private, next to the triage
+/// dedup case above it.
+#[test]
+fn unmeasurable_sidecar_warns_once_and_again_when_it_returns() {
+    let storage = storage_with_sql("unmeasurable", &[VALID_SCHEMA, UID_ROW, SDK_ROW]);
+    let snap = unique_dir("unmeasurable-snap");
+    let mut reader = DbReader::new(storage.clone(), snap.clone(), None).unwrap();
+
+    assert_eq!(reader.refresh(), Refresh::Updated);
+    assert_eq!(
+        reader.last_warning(),
+        None,
+        "a healthy reader has said nothing"
+    );
+
+    // A sidecar that is there and cannot be read through: a symlink loop,
+    // which the kernel refuses to resolve every time.
+    let wal = storage.join("LocalStorage.db-wal");
+    std::os::unix::fs::symlink("LocalStorage.db-wal", &wal).unwrap();
+    for tick in 1..=5 {
+        assert_eq!(
+            reader.refresh(),
+            Refresh::Unchanged,
+            "tick {tick} is held at the last accepted data"
+        );
+    }
+    assert_eq!(
+        reader.last_warning(),
+        Some("signature"),
+        "a fault that persists is reported, and the record does not change \
+         across the ticks that follow, which is what stops them printing again"
+    );
+    // The count, which is the part a test of the record alone cannot reach:
+    // the record reads the same whether the first tick printed a line or
+    // the fifth did. Without this, dropping the guard would leave every
+    // assertion above passing and the warning would repeat every tick.
+    assert_eq!(
+        reader.signature_warnings(),
+        1,
+        "five blocked ticks, one line: the dedup bounds a persistent fault \
+         to a single warning rather than one per tick"
+    );
+
+    // A healthy tick clears the record, so the fault returning is news.
+    fs::remove_file(&wal).unwrap();
+    let db = storage.join("LocalStorage.db");
+    let later = fs::metadata(&db).unwrap().modified().unwrap() + std::time::Duration::from_secs(60);
+    std::fs::File::options()
+        .write(true)
+        .open(&db)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(later))
+        .unwrap();
+    assert_eq!(
+        reader.refresh(),
+        Refresh::Updated,
+        "a healthy tick triages again"
+    );
+    assert_eq!(
+        reader.last_warning(),
+        None,
+        "a tick with nothing to report clears the record, so a fault that \
+         returns later is a change and not a repeat of the old one"
+    );
+
+    std::os::unix::fs::symlink("LocalStorage.db-wal", &wal).unwrap();
+    assert_eq!(reader.refresh(), Refresh::Unchanged);
+    assert_eq!(
+        reader.last_warning(),
+        Some("signature"),
+        "and the returning fault is reported again rather than swallowed by \
+         the record of the one that was fixed"
+    );
+    assert_eq!(
+        reader.signature_warnings(),
+        2,
+        "and it is a second line, not a silent repeat: a fault that clears and \
+         returns has changed the situation, which is what the record clearing \
+         on a successful tick buys"
+    );
+
+    let _ = fs::remove_dir_all(&storage);
+    let _ = fs::remove_dir_all(&snap);
+}
+
 #[test]
 fn hint_without_override_points_to_list_accounts() {
     let storage = unique_dir("hint-auto");
@@ -339,17 +444,6 @@ fn hint_without_override_points_to_list_accounts() {
     });
     assert!(hint.contains("--list-accounts"), "unexpected hint: {hint}");
     assert!(hint.contains("--account-index"), "unexpected hint: {hint}");
-    let _ = fs::remove_dir_all(&storage);
-    let _ = fs::remove_dir_all(&snap);
-}
-
-#[test]
-fn triage_success_resets_tracking() {
-    let storage = make_storage("reset", "111111111", "Europe", 60);
-    let snap = unique_dir("reset-snap");
-    let mut reader = DbReader::new(storage.clone(), snap.clone(), None).unwrap();
-    assert_eq!(reader.refresh(), Refresh::Updated);
-    assert_eq!(reader.last_triage(), None);
     let _ = fs::remove_dir_all(&storage);
     let _ = fs::remove_dir_all(&snap);
 }
@@ -614,38 +708,6 @@ fn list_accounts_attaches_login_nicknames() {
 }
 
 #[test]
-fn read_last_login_accepts_only_usable_markers() {
-    use std::io::Write as _;
-
-    let dir = unique_dir("last-login");
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("KRSDKUserCache.json");
-    let write = |body: &str| {
-        let mut file = fs::File::create(&path).unwrap();
-        file.write_all(body.as_bytes()).unwrap();
-    };
-
-    write(r#"{"last_login_cuid": "222222222"}"#);
-    assert_eq!(
-        crate::db::read_last_login(&path),
-        Some("222222222".to_string())
-    );
-    // Missing, empty, non-string or garbage: None, never an error.
-    write(r#"{"account_list": []}"#);
-    assert_eq!(crate::db::read_last_login(&path), None);
-    write(r#"{"last_login_cuid": ""}"#);
-    assert_eq!(crate::db::read_last_login(&path), None);
-    write(r#"{"last_login_cuid": 123}"#);
-    assert_eq!(crate::db::read_last_login(&path), None);
-    write("not json");
-    assert_eq!(crate::db::read_last_login(&path), None);
-    assert_eq!(crate::db::read_last_login(&dir.join("missing.json")), None);
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
 fn launcher_cache_path_resolves_steam_layout_only() {
     let root = unique_dir("prefix");
     let _ = fs::remove_dir_all(&root);
@@ -811,21 +873,25 @@ fn query_kd_names_matches_exact_live_rows_only() {
     );
     // First exact match wins; other uids, malformed rows and garbage pass by.
     assert_eq!(
-        crate::db::query_kd_names(&path, "111111111").as_deref(),
-        Some("First")
+        crate::db::query_kd_names(&path, "111111111"),
+        crate::telemetry_cache::Lookup::Answered(Some("First".to_string()))
     );
     assert_eq!(
-        crate::db::query_kd_names(&path, "222222222").as_deref(),
-        Some("Al")
+        crate::db::query_kd_names(&path, "222222222"),
+        crate::telemetry_cache::Lookup::Answered(Some("Al".to_string()))
     );
     assert_eq!(
-        crate::db::query_kd_names(&path, "555555555").as_deref(),
-        Some("Numeric")
+        crate::db::query_kd_names(&path, "555555555"),
+        crate::telemetry_cache::Lookup::Answered(Some("Numeric".to_string()))
     );
-    assert_eq!(crate::db::query_kd_names(&path, "999999999"), None);
+    assert_eq!(
+        crate::db::query_kd_names(&path, "999999999"),
+        crate::telemetry_cache::Lookup::Answered(None)
+    );
     let _ = fs::remove_dir_all(path.parent().unwrap());
 
-    // Missing table or file: None, never an error.
+    // A search that ran answers, even when it found nothing; a file that
+    // could not be read does not.
     let empty_dir = unique_dir("kd-empty");
     let _ = fs::remove_dir_all(&empty_dir);
     fs::create_dir_all(&empty_dir).unwrap();
@@ -834,10 +900,19 @@ fn query_kd_names_matches_exact_live_rows_only() {
         .unwrap()
         .execute_batch("CREATE TABLE KDData (id INTEGER PRIMARY KEY)")
         .unwrap();
-    assert_eq!(crate::db::query_kd_names(&empty, "111111111"), None);
+    assert_eq!(
+        crate::db::query_kd_names(&empty, "111111111"),
+        crate::telemetry_cache::Lookup::Unread
+    );
     assert_eq!(
         crate::db::query_kd_names(&empty_dir.join("missing.db"), "111111111"),
-        None
+        crate::telemetry_cache::Lookup::Unread
+    );
+    let garbage = empty_dir.join("garbage.db");
+    fs::write(&garbage, b"not a database at all").unwrap();
+    assert_eq!(
+        crate::db::query_kd_names(&garbage, "111111111"),
+        crate::telemetry_cache::Lookup::Unread
     );
     let _ = fs::remove_dir_all(&empty_dir);
 }
@@ -1047,4 +1122,204 @@ fn refresh_synthesizes_rich_data_from_remnants() {
 
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&snap);
+}
+
+/// Pins the per-tick log lines byte for byte.
+///
+/// The builders under test hold the whole of each sentence a tick can
+/// print, so an exact string here is that exact sentence in the log: any
+/// edit to a message breaks this test on purpose, and the fix is to
+/// decide the new text, not to loosen the assertion.
+///
+/// What this does not cover is when a line prints: level gating lives in
+/// the log module and is pinned by its own tests, and the lines themselves
+/// go to the process's stderr, which no test can read.
+#[test]
+fn tick_log_messages_keep_exact_text() {
+    assert_eq!(
+        accepted_message(true, false),
+        "snapshot accepted; quests data: true, version data: false"
+    );
+    assert_eq!(
+        accepted_message(false, true),
+        "snapshot accepted; quests data: false, version data: true"
+    );
+    assert_eq!(
+        missing_level_message(3, true),
+        "level row missing for live login (expected 1 row, found 3 other row(s), \
+         login seen elsewhere: true); trying telemetry remnants"
+    );
+    assert_eq!(
+        scan_census_message(RemnantStats {
+            candidates: 2,
+            role_hits: 2,
+            fresh_hits: 1,
+        }),
+        "telemetry scan: 2 candidate(s), 2 login event(s), 1 fresh event(s)"
+    );
+    assert_eq!(
+        recovered_message(90, true),
+        "role identity recovered from launcher telemetry (event age 90s): \
+         complemented name+level+region; quests unavailable (no quest row for this login); \
+         version attached: true"
+    );
+}
+
+/// Pins the remnant scan's search contract: every `"role_id"` hit is
+/// visited in order, and each hit resolves against the marker nearest
+/// BEHIND it rather than the first one in the window.
+///
+/// Two events for the same login sit inside one 4 KiB marker window: a
+/// stale one first, a fresh one second. The fresh hit's window therefore
+/// holds both markers, and only the nearest-behind choice parses the
+/// fresh event — a first-in-window search would re-read the stale one,
+/// skip it, and recover nothing. The census pins the walk itself: two
+/// candidates found, both for the login, one fresh.
+#[test]
+fn remnant_scan_resolves_each_hit_against_its_nearest_marker() {
+    let now = test_now_ms();
+    let stale = format!(
+        "s{{\"#distinct_id\":\"d1\",\"properties\":{{\"role_id\":\"111111111\",\
+         \"role_name\":\"Old\",\"role_level\":\"60\",\"server_name\":\"Europe\",\
+         \"event_time_ms\":\"{}\"}}}}",
+        now - MAX_REMANT_AGE_MS - 60_000
+    );
+    let fresh = format!(
+        "s{{\"#distinct_id\":\"d2\",\"properties\":{{\"role_id\":\"111111111\",\
+         \"role_name\":\"New\",\"role_level\":\"64\",\"server_name\":\"America\",\
+         \"event_time_ms\":\"{}\"}}}}",
+        now - 1_000
+    );
+    let mut bytes = b"prefix-noise".to_vec();
+    bytes.extend_from_slice(stale.as_bytes());
+    bytes.extend_from_slice(b"filler");
+    bytes.extend_from_slice(fresh.as_bytes());
+    bytes.extend_from_slice(b"trailer");
+
+    let (role, stats) = find_remnant_role(&bytes, "111111111", now);
+    let role = role.unwrap();
+    assert_eq!(role.name, "New");
+    assert_eq!(role.level, 64);
+    assert_eq!(role.region, "America");
+    assert_eq!(
+        stats,
+        RemnantStats {
+            candidates: 2,
+            role_hits: 2,
+            fresh_hits: 1,
+        }
+    );
+}
+
+/// A tick that measures the source and finds it unchanged re-arms the warning.
+///
+/// The fault here clears without rewriting any measured file: locking the
+/// directory that holds the linked sidecar hides it, unlocking restores the
+/// same fold, so the middle tick takes the unchanged early return instead of
+/// the success path. Only that return clearing the record lets the fault
+/// coming back warn a second time. Ticks that never measure the source keep
+/// the record, so a fault that persists still costs exactly one line.
+///
+/// The link matters: locking the database directory itself would hide the
+/// main file too, which fails earlier and silently. The mode is restored by
+/// a guard on every exit. Each lock is checked rather than assumed: a runner
+/// the lock does not block cannot stage this fault, so the test returns
+/// there instead of asserting on a condition it never built.
+#[test]
+fn unchanged_tick_rearms_the_signature_warning() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    /// Restores a directory's mode on drop, so a locked directory never
+    /// escapes the test, whatever path leaves it.
+    struct ModeRestore {
+        dir: std::path::PathBuf,
+    }
+    impl Drop for ModeRestore {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    fn lock(dir: &std::path::Path) {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o000)).unwrap();
+    }
+
+    fn unlock(dir: &std::path::Path) {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let storage = storage_with_sql("latch-unchanged", &[VALID_SCHEMA, UID_ROW, SDK_ROW]);
+    let snap = unique_dir("latch-unchanged-snap");
+    let mut reader = DbReader::new(storage.clone(), snap.clone(), None).unwrap();
+
+    // The sidecar is a link into a second directory, so locking that
+    // directory hides the sidecar while the main database stays readable.
+    // Only the directory's mode moves, never a measured file, so unlocking
+    // restores the accepted fold exactly.
+    let outer = unique_dir("latch-unchanged-outer");
+    let _ = fs::remove_dir_all(&outer);
+    fs::create_dir_all(&outer).unwrap();
+    let target = outer.join("wal-target");
+    fs::write(&target, b"write-ahead log stand-in").unwrap();
+    let wal = storage.join("LocalStorage.db-wal");
+    std::os::unix::fs::symlink(&target, &wal).unwrap();
+    let _mode_guard = ModeRestore { dir: outer.clone() };
+
+    assert_eq!(reader.refresh(), Refresh::Updated);
+    assert_eq!(reader.last_warning(), None);
+    assert_eq!(reader.signature_warnings(), 0);
+
+    lock(&outer);
+    if fs::metadata(&wal).is_ok() {
+        // The lock does not block this runner, so the fault cannot be
+        // staged here and there is nothing to pin on it.
+        unlock(&outer);
+        let _ = fs::remove_file(&wal);
+        let _ = fs::remove_dir_all(&storage);
+        let _ = fs::remove_dir_all(&snap);
+        let _ = fs::remove_dir_all(&outer);
+        return;
+    }
+    assert_eq!(reader.refresh(), Refresh::Unchanged);
+    assert_eq!(reader.last_warning(), Some("signature"));
+    assert_eq!(reader.signature_warnings(), 1);
+    // A fault that never left warns once, however many ticks it spans.
+    assert_eq!(reader.refresh(), Refresh::Unchanged);
+    assert_eq!(reader.signature_warnings(), 1);
+
+    unlock(&outer);
+    assert!(
+        fs::metadata(&wal).is_ok(),
+        "restoring the mode must make the linked sidecar readable again"
+    );
+    assert_eq!(
+        reader.refresh(),
+        Refresh::Unchanged,
+        "the restored fold equals the accepted one, so no re-read happens"
+    );
+    assert_eq!(reader.signature_warnings(), 1);
+    let rearmed = reader.last_warning().is_none();
+
+    lock(&outer);
+    assert!(
+        fs::metadata(&wal).is_err(),
+        "a locked holding directory must hide the linked sidecar"
+    );
+    assert_eq!(reader.refresh(), Refresh::Unchanged);
+    assert!(
+        rearmed,
+        "the unchanged tick must clear the record, or a returning fault reads as the old one"
+    );
+    assert_eq!(reader.last_warning(), Some("signature"));
+    assert_eq!(
+        reader.signature_warnings(),
+        2,
+        "a fault that cleared and returned is a new condition, not the old one"
+    );
+
+    unlock(&outer);
+    let _ = fs::remove_file(&wal);
+    let _ = fs::remove_dir_all(&storage);
+    let _ = fs::remove_dir_all(&snap);
+    let _ = fs::remove_dir_all(&outer);
 }

@@ -8,16 +8,17 @@
 
 //! Playable-character icon keys for `--character`.
 //!
-//! Portrait source of truth (images only, never vendored here — the
-//! upstream repo carries no license and the art belongs to Kuro Games):
-//! `ryanbenson/wuthering-waves-assets`, `images/*.png`, PascalCase stems
-//! (`Carlotta.png`, `XiangliYao.png`, Rover variants with a `Male`/`Female`
-//! suffix). Discord only renders assets uploaded to the application, so a
-//! name here is just a KEY: upload the PNG to the app under the same
-//! lowercase name, then `--character <name>`.
+//! Every character carries two art keys, and which one applies depends on
+//! the slot. `asset` is a Discord art-asset key, so it renders only after
+//! that PNG is uploaded to the application under the same lowercase name;
+//! `file` is the upstream stem, and [`portrait_url`] turns it into the
+//! external `https://` URL that renders in any slot with no upload at all.
 //!
-//! New characters are one line in the `CHARACTERS` table below (plus the
-//! portal upload).
+//! Portraits come from `ryanbenson/wuthering-waves-assets`, `images/*.png`,
+//! PascalCase stems (`Carlotta.png`, `XiangliYao.png`, Rover variants
+//! ending in `Male`/`Female`). They are never vendored here: the upstream
+//! repo carries no license and the art belongs to Kuro Games. A new
+//! character is one line in the `CHARACTERS` table below.
 
 /// One selectable character: match key, Discord asset key, hover text,
 /// upstream file stem.

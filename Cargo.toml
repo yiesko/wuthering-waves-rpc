@@ -3,10 +3,10 @@ name = "wwrpc"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.95"
-description = "Wuthering Waves Discord Rich Presence for Linux (Steam/Proton): auto-detects the game, reads Union Level and Region from a RAM copy of LocalStorage, publishes tiered rich presence with character portraits"
+description = "Wuthering Waves Discord Rich Presence for Linux (Steam/Proton): auto-detects the game, reads Union Level and Region from a private copy of LocalStorage, publishes tiered rich presence with character portraits"
 license = "GPL-3.0-only"   # full text in COPYING
 readme = "README.md"
-repository = "https://github.com/yiesko/wwrpc"
+repository = "https://github.com/yiesko/wuthering-waves-rpc"
 keywords = ["discord", "rich-presence", "wuthering-waves", "linux", "gaming"]
 categories = ["command-line-utilities"]
 
@@ -18,10 +18,21 @@ categories = ["command-line-utilities"]
 rsrpc-core = { git = "https://github.com/yiesko/rsRPC.git", tag = "v0.38.0" }
 rsrpc-detect = { git = "https://github.com/yiesko/rsRPC.git", tag = "v0.38.0" }
 rusqlite = { version = "0.40", features = ["bundled"] }
+# serde_json re-exports none of serde's traits, so a hand-written
+# Deserialize has to name serde itself. The traits used are Deserialize,
+# Deserializer, de::Visitor and de::IgnoredAny; the cache is parsed by hand
+# so an unexpected JSON shape degrades to an absent field rather than a
+# failed read, which a derive cannot express. serde is already in the graph
+# through rsRPC's message decoding, so naming it adds no package.
+serde = "1"
 serde_json = "1.0"
 ureq = { version = "3", default-features = false, features = ["rustls", "charset"] }
 clap = { version = "4", features = ["derive", "help", "usage"] }
-ctrlc = "3"
+# The termination feature is what registers the handler for SIGTERM and
+# SIGHUP next to SIGINT. Without it, `systemctl --user stop` takes the
+# signal's default action: the daemon dies without entering the publishing
+# loop's shutdown path and leaves its presence published in Discord.
+ctrlc = { version = "3", features = ["termination"] }
 libc = "0.2"
 chrono = "0.4"
 

@@ -57,7 +57,7 @@ One-shot / diagnostic flags (no daemon needed, no env equivalent):
 | Flag | Meaning |
 |---|---|
 | `--game-dir <DIR>` | Game install dir (auto-discovered: Steam, `~/Games`, Twintail data) |
-| `--no-database` | No game-file access; static presence instead |
+| `--no-database` | No game-file reads; silence unless `--static-fallback` adds static text (`--list-accounts` still lists the database) |
 | `--static-fallback` | Publish static "Exploring SOL-III" with no rich data (default off: stay silent so game detection owns the slot) |
 | `--kuro-uid <UID>` | Match account by Kuro UID (auto-detected login otherwise; prefer `--account-index`) |
 | `--account-index <N>` | Pin the Nth stored account (see `--list-accounts`; wins over `--kuro-uid`) |

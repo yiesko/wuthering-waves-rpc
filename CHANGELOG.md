@@ -53,5 +53,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - rsRPC dependency pinned to tag `v0.32.0` (was floating `main`):
   the game-page companion relies on its IPC-wins handoff.
 
-[Unreleased]: https://github.com/yiesko/wwRPC/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/yiesko/wwRPC/releases/tag/v0.2.0
+[Unreleased]: https://github.com/yiesko/wuthering-waves-rpc/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/yiesko/wuthering-waves-rpc/releases/tag/v0.2.0
