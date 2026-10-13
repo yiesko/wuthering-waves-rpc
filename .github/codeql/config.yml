@@ -1,0 +1,25 @@
+# Configuration for the code analysis workflow.
+#
+# Two files are left out of the analysis, and the list is deliberately the
+# two files and not the directories that hold them: every other test file
+# stays analysed.
+#
+# Both are false positives of the same kind. Each asserts on what the
+# production code prints, so each has to call the formatter, and the query
+# reports the call. A test cannot assert on output without being flagged
+# for touching the thing it asserts about.
+#
+# The scan runs without a build step, which is the combination for which
+# `paths-ignore` is documented to apply to Rust.
+#
+# There is no narrower way to write this. A query filter matches on query
+# metadata — id, tags, severity — and has no key for the path of the code a
+# query examines, so a rule cannot be switched off for one directory and
+# left on elsewhere. And an inline `// codeql[...]` comment does nothing in
+# Rust: the language has no suppression query, which is why this file
+# exists instead.
+#
+# Removing either entry brings that file's findings back.
+paths-ignore:
+  - 'src/tests/listing.rs'
+  - 'tests/launcher_cache_parser.rs'

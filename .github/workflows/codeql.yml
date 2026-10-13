@@ -52,6 +52,9 @@ jobs:
           # to `languages` (a list) and rejects the old name outright.
           languages: rust
           build-mode: none
+          # Without this the configuration file is never read, whatever it
+          # says. See it for why the test tree is out of the analysis.
+          config-file: ./.github/codeql/config.yml
           # The default query suite. `security-extended` is the first thing
           # to try if the default set comes up quiet on this much `unsafe`.
 

@@ -352,8 +352,9 @@ fn print_accounts(game_dir: &Path, storage_dir: &Path) -> Result<(), Box<dyn Err
 /// hides nothing but stars — a name the mask's own marker already spells.
 /// A row with no nickname carries no parentheses at all.
 ///
-/// It formats and nothing more: it reads no file, opens no socket, and
-/// the caller decides what becomes of the string.
+/// It formats and nothing more: it reads no file, opens no socket, and the
+/// caller decides what becomes of the string — here, one line of a listing
+/// the reader asked for by running the command that produces it.
 fn account_line(account: &StoredAccount) -> String {
     let marker = if account.last_login {
         " [last launcher login]"
