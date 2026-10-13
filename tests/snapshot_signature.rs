@@ -659,3 +659,101 @@ fn test_a_sidecar_that_cannot_be_measured_holds_the_tick() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+/// Pins that a sidecar symlink with no target is a file that is there, not
+/// a file that is absent: the fold reports it instead of folding it into
+/// the sentinel.
+///
+/// `fs::metadata` follows the link and fails with `NotFound`, which is the
+/// kind the fold reads as "the game keeps no such file". A dangling link
+/// has an entry of its own — `symlink_metadata` reports it — so folding it
+/// in would hide a file that exists behind the ordinary rollback-journal
+/// case, which keeps no sidecar at all. Lifting the link returns the set to
+/// that ordinary case, which must stay silent.
+#[test]
+fn test_a_dangling_sidecar_symlink_is_reported_not_folded() {
+    let (root, storage) = bare_storage("dangling-symlink", 60);
+    let bare = snapshot_signature(&storage).expect("a database with no sidecars is measurable");
+
+    let wal = storage.join("LocalStorage.db-wal");
+    symlink("LocalStorage.db-missing-target", &wal).expect("the dangling sidecar is planted");
+    assert!(
+        wal.symlink_metadata()
+            .is_ok_and(|meta| meta.file_type().is_symlink()),
+        "the fixture must really plant a link, or the error below proves nothing"
+    );
+    let err = snapshot_signature(&storage)
+        .expect_err("a sidecar entry that cannot be measured is not an absent one");
+    assert_ne!(
+        err.kind(),
+        io::ErrorKind::NotFound,
+        "a link with no target is still an entry that is there: {err}"
+    );
+    assert_eq!(
+        err.kind(),
+        io::ErrorKind::Other,
+        "a file that is there but cannot be resolved is neither absent nor \
+         forbidden: a permission kind would misdirect the operator, and the \
+         sentinel kind would hide the file: {err}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("LocalStorage.db-wal"),
+        "the error must name the file it is about, or an operator reading \
+         the warning has three sidecars and no way to tell which one: {message}"
+    );
+    assert!(
+        message.contains("(os error 2)"),
+        "and it must still carry the OS error underneath the path, or the \
+         wrap has swallowed the diagnosis: {message}"
+    );
+
+    fs::remove_file(&wal).expect("the dangling sidecar is gone");
+    assert_eq!(
+        snapshot_signature(&storage).expect("a database with no sidecars is measurable"),
+        bare,
+        "lifting the link returns the set to its ordinary absent-sidecar \
+         version, not to a third one"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Pins that a sidecar symlink resolving to a real file keeps working: it
+/// is followed and folded in like the file itself, not reported.
+///
+/// The counterpart of the dangling case — the fix tells the two apart by
+/// whether an entry is present, and a naive version refuses every link. A
+/// signature taken through the link must describe the target's bytes, so it
+/// differs from the version with no sidecar at all and stays put while
+/// nothing is written.
+#[test]
+fn test_a_live_sidecar_symlink_is_followed_and_folded() {
+    let (root, storage) = bare_storage("live-symlink", 60);
+    let bare = snapshot_signature(&storage).expect("a database with no sidecars is measurable");
+
+    fs::write(storage.join("wal-target"), b"a write-ahead log")
+        .expect("the link target is written");
+    let wal = storage.join("LocalStorage.db-wal");
+    symlink("wal-target", &wal).expect("the live sidecar link is planted");
+    assert!(
+        wal.symlink_metadata()
+            .is_ok_and(|meta| meta.file_type().is_symlink()),
+        "the fixture must really plant a link, or the measurement below \
+         proves nothing"
+    );
+
+    let linked = snapshot_signature(&storage).expect("a sidecar link to a real file is measurable");
+    assert_ne!(
+        linked, bare,
+        "a link resolving to a real file is folded in like the file \
+         itself; a fold that read it as absent would return the bare version"
+    );
+    assert_eq!(
+        snapshot_signature(&storage).expect("the storage dir is measurable"),
+        linked,
+        "measuring an untouched directory twice describes one version"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}

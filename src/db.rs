@@ -1131,8 +1131,11 @@ pub(crate) fn recovered_message(event_age_secs: u64, version_attached: bool) -> 
 /// # Errors
 ///
 /// [`io::ErrorKind::NotFound`] when the main database is not there, and
-/// whatever measuring a file failed with otherwise, untouched in kind. An
-/// absent sidecar is the one absence that is not an error.
+/// whatever measuring a file failed with otherwise. An absent sidecar is
+/// the one absence that is not an error; an entry that is present but
+/// cannot be resolved — a link with no target — arrives with a kind other
+/// than [`io::ErrorKind::NotFound`], so the caller never reads it as
+/// absent.
 pub fn snapshot_signature(dir: &Path) -> io::Result<FileSignature> {
     // The main database first, and on its own terms: it is the file a
     // snapshot is built on, and nothing here substitutes for it.
@@ -1205,6 +1208,18 @@ fn signature_part(path: &Path) -> io::Result<(i128, u64)> {
     // can act on when three sidecars are in question. The kind survives the
     // wrap, which is what the caller's `NotFound` branch matches on.
     let meta = fs::metadata(path).map_err(|err| {
+        // A link with no target reads as `NotFound` through `metadata`,
+        // which follows it — and `NotFound` is the fold's sentinel for "the
+        // game keeps no such file". An entry is really there, though, which
+        // `symlink_metadata` reports without following it, so folding a file
+        // that exists into the absent case would hide it from the caller.
+        // The error is re-kindled so the fold reports it instead: a generic
+        // kind, because the entry is neither a permission fault nor a game
+        // that is not there, and the path and the errno stay in the message
+        // to carry the diagnosis.
+        if err.kind() == io::ErrorKind::NotFound && fs::symlink_metadata(path).is_ok() {
+            return io::Error::other(format!("cannot measure '{}': {err}", path.display()));
+        }
         io::Error::new(
             err.kind(),
             format!("cannot measure '{}': {err}", path.display()),
