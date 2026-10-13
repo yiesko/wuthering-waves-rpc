@@ -622,15 +622,17 @@ impl DbReader {
                 // telemetry lookup is keyed on that file's signature: when
                 // nothing was written since, this costs a stat and no copy.
                 self.refresh_display_name();
-                log::debug(format!(
-                    "snapshot accepted; quests data: {}, version data: {}",
-                    self.last
+                if log::is_verbose() {
+                    let quests = self
+                        .last
                         .as_ref()
-                        .is_some_and(|info| info.quests_done.is_some()),
-                    self.last
+                        .is_some_and(|info| info.quests_done.is_some());
+                    let version = self
+                        .last
                         .as_ref()
-                        .is_some_and(|info| info.game_version.is_some())
-                ));
+                        .is_some_and(|info| info.game_version.is_some());
+                    log::debug(accepted_message(quests, version));
+                }
                 Refresh::Updated
             }
             Err(err) => {
@@ -650,26 +652,20 @@ impl DbReader {
                         known_accounts,
                         uid_seen_elsewhere,
                     } = err
+                        && log::is_verbose()
                     {
-                        log::debug(format!(
-                            "level row missing for live login (expected 1 row, found {known_accounts} other row(s), \
-               login seen elsewhere: {uid_seen_elsewhere}); trying telemetry remnants"
-                        ));
+                        log::debug(missing_level_message(known_accounts, uid_seen_elsewhere));
                     }
                     let (recovered, stats) = self.remnant_role(&live);
-                    log::debug(format!(
-                        "telemetry scan: {} candidate(s), {} login event(s), {} fresh event(s)",
-                        stats.candidates, stats.role_hits, stats.fresh_hits
-                    ));
+                    if log::is_verbose() {
+                        log::debug(scan_census_message(stats));
+                    }
                     if let Some(role) = recovered {
                         let age_secs = epoch_millis()
                             .map_or(0, |now_ms| now_ms.saturating_sub(role.event_ms) / 1000);
-                        log::info(format!(
-                            "role identity recovered from launcher telemetry (event age {age_secs}s): \
-               complemented name+level+region; quests unavailable (no quest row for this login); \
-               version attached: {}",
-                            self.cached_version.is_some()
-                        ));
+                        if !log::is_quiet() {
+                            log::info(recovered_message(age_secs, self.cached_version.is_some()));
+                        }
                         self.last_signature = Some(signature);
                         self.last_reported = None;
                         self.last = Some(PlayerInfo {
@@ -944,7 +940,9 @@ impl DbReader {
         // large, rewritten mid-copy) reads its reason from the error, the way
         // the size check used to report it.
         if let Err(err) = bounded_copy(kd_src, &snap_copy, MAX_DB_BYTES, DestMode::Overwrite) {
-            log::debug(format!("telemetry scan skipped: copy failed ({err})"));
+            if log::is_verbose() {
+                log::debug(format!("telemetry scan skipped: copy failed ({err})"));
+            }
             return Lookup::Unread;
         }
         let bytes = fs::read(&snap_copy).ok();
@@ -1057,6 +1055,44 @@ impl DbReader {
             })
             .collect())
     }
+}
+
+/// The line a tick that accepted a snapshot prints: which enrichment
+/// survived triage, as shapes only. Built only when the level prints it,
+/// so a quiet tick pays nothing for the sentence.
+pub(crate) fn accepted_message(quests_done: bool, version_known: bool) -> String {
+    format!("snapshot accepted; quests data: {quests_done}, version data: {version_known}")
+}
+
+/// The line a tick prints before scanning telemetry remnants: what triage
+/// wanted against what the database held, as shapes only. Same lazy rule
+/// as [`accepted_message`]: no allocation when the level is off.
+pub(crate) fn missing_level_message(known_accounts: usize, uid_seen_elsewhere: bool) -> String {
+    format!(
+        "level row missing for live login (expected 1 row, found {known_accounts} other row(s), \
+         login seen elsewhere: {uid_seen_elsewhere}); trying telemetry remnants"
+    )
+}
+
+/// The line a tick prints after scanning telemetry remnants: the scan
+/// census, shapes only. Built under the same lazy rule; the numbers come
+/// from the cache, so this reads like a scan that just ran either way.
+pub(crate) fn scan_census_message(stats: RemnantStats) -> String {
+    format!(
+        "telemetry scan: {} candidate(s), {} login event(s), {} fresh event(s)",
+        stats.candidates, stats.role_hits, stats.fresh_hits
+    )
+}
+
+/// The line a tick that recovered an identity from remnants prints: how
+/// old the event was and whether a version rode along, shapes only.
+/// An info line, so it is built only while info lines print.
+pub(crate) fn recovered_message(event_age_secs: u64, version_attached: bool) -> String {
+    format!(
+        "role identity recovered from launcher telemetry (event age {event_age_secs}s): \
+         complemented name+level+region; quests unavailable (no quest row for this login); \
+         version attached: {version_attached}"
+    )
 }
 
 /// One version of everything a per-tick snapshot is built from: the
@@ -1392,19 +1428,63 @@ pub(crate) fn find_remnant_role(
     (best, stats)
 }
 
-/// Byte-subslice search (avoids UTF-8 assumptions over foreign bytes).
+/// First occurrence of `needle` in `haystack` (avoids UTF-8 assumptions
+/// over foreign bytes).
+///
+/// Linear in the buffer for a fixed needle: one pass skips to each
+/// first-byte hit and only hits pay the full compare, instead of
+/// comparing every window. An empty needle matches at the start, and a
+/// needle longer than the buffer never matches. Dependency-free: both
+/// call sites pass short literals.
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
+    if needle.is_empty() {
+        return Some(0);
+    }
+    if needle.len() > haystack.len() {
+        return None;
+    }
+    let first = needle[0];
+    let mut offset = 0;
+    while offset + needle.len() <= haystack.len() {
+        let pos = offset + haystack[offset..].iter().position(|&byte| byte == first)?;
+        if pos + needle.len() > haystack.len() {
+            return None;
+        }
+        if haystack[pos..].starts_with(needle) {
+            return Some(pos);
+        }
+        offset = pos + 1;
+    }
+    None
 }
 
 /// Last occurrence: the marker nearest BEHIND a hit, not the first in the
 /// window (a window can span several adjacent events).
+///
+/// Linear for the same reason as [`find_subslice`], from the other end:
+/// one backward pass over the needle's last byte, full compare only on
+/// hits. Empty and over-long needles answer the same way as there, so
+/// the two stay interchangeable wherever a direction is not the point.
 fn rfind_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .rposition(|window| window == needle)
+    if needle.is_empty() {
+        return Some(haystack.len());
+    }
+    if needle.len() > haystack.len() {
+        return None;
+    }
+    let last = needle[needle.len() - 1];
+    let mut end = haystack.len();
+    loop {
+        let stop = haystack[..end].iter().rposition(|&byte| byte == last)? + 1;
+        if stop < needle.len() {
+            return None;
+        }
+        let pos = stop - needle.len();
+        if haystack[pos..].starts_with(needle) {
+            return Some(pos);
+        }
+        end = stop - 1;
+    }
 }
 
 /// End offset (exclusive) of the `{...}` object starting at `bytes[0]`,

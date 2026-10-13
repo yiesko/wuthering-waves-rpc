@@ -1,10 +1,11 @@
 use std::fs;
 
 use crate::db::{
-    DbReader, MAX_REMANT_AGE_MS, Refresh, TriageError, check_integrity, check_schema,
-    discover_game_dir, find_remnant_role, has_account_data, is_numbered_db, load_sdk_level,
-    load_sdk_level_by_index, load_uid, parse_account_list, parse_quest_count, parse_sdk_level_data,
-    resolve_storage, resolve_storage_dir,
+    DbReader, MAX_REMANT_AGE_MS, Refresh, RemnantStats, TriageError, accepted_message,
+    check_integrity, check_schema, discover_game_dir, find_remnant_role, has_account_data,
+    is_numbered_db, load_sdk_level, load_sdk_level_by_index, load_uid, missing_level_message,
+    parse_account_list, parse_quest_count, parse_sdk_level_data, recovered_message,
+    resolve_storage, resolve_storage_dir, scan_census_message,
 };
 
 const SDK_BODY: &str = r#"{
@@ -1108,4 +1109,91 @@ fn refresh_synthesizes_rich_data_from_remnants() {
 
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&snap);
+}
+
+/// Pins the per-tick log lines byte for byte.
+///
+/// The builders under test hold the whole of each sentence a tick can
+/// print, so an exact string here is that exact sentence in the log: any
+/// edit to a message breaks this test on purpose, and the fix is to
+/// decide the new text, not to loosen the assertion.
+///
+/// What this does not cover is when a line prints: level gating lives in
+/// the log module and is pinned by its own tests, and the lines themselves
+/// go to the process's stderr, which no test can read.
+#[test]
+fn tick_log_messages_keep_exact_text() {
+    assert_eq!(
+        accepted_message(true, false),
+        "snapshot accepted; quests data: true, version data: false"
+    );
+    assert_eq!(
+        accepted_message(false, true),
+        "snapshot accepted; quests data: false, version data: true"
+    );
+    assert_eq!(
+        missing_level_message(3, true),
+        "level row missing for live login (expected 1 row, found 3 other row(s), \
+         login seen elsewhere: true); trying telemetry remnants"
+    );
+    assert_eq!(
+        scan_census_message(RemnantStats {
+            candidates: 2,
+            role_hits: 2,
+            fresh_hits: 1,
+        }),
+        "telemetry scan: 2 candidate(s), 2 login event(s), 1 fresh event(s)"
+    );
+    assert_eq!(
+        recovered_message(90, true),
+        "role identity recovered from launcher telemetry (event age 90s): \
+         complemented name+level+region; quests unavailable (no quest row for this login); \
+         version attached: true"
+    );
+}
+
+/// Pins the remnant scan's search contract: every `"role_id"` hit is
+/// visited in order, and each hit resolves against the marker nearest
+/// BEHIND it rather than the first one in the window.
+///
+/// Two events for the same login sit inside one 4 KiB marker window: a
+/// stale one first, a fresh one second. The fresh hit's window therefore
+/// holds both markers, and only the nearest-behind choice parses the
+/// fresh event — a first-in-window search would re-read the stale one,
+/// skip it, and recover nothing. The census pins the walk itself: two
+/// candidates found, both for the login, one fresh.
+#[test]
+fn remnant_scan_resolves_each_hit_against_its_nearest_marker() {
+    let now = test_now_ms();
+    let stale = format!(
+        "s{{\"#distinct_id\":\"d1\",\"properties\":{{\"role_id\":\"111111111\",\
+         \"role_name\":\"Old\",\"role_level\":\"60\",\"server_name\":\"Europe\",\
+         \"event_time_ms\":\"{}\"}}}}",
+        now - MAX_REMANT_AGE_MS - 60_000
+    );
+    let fresh = format!(
+        "s{{\"#distinct_id\":\"d2\",\"properties\":{{\"role_id\":\"111111111\",\
+         \"role_name\":\"New\",\"role_level\":\"64\",\"server_name\":\"America\",\
+         \"event_time_ms\":\"{}\"}}}}",
+        now - 1_000
+    );
+    let mut bytes = b"prefix-noise".to_vec();
+    bytes.extend_from_slice(stale.as_bytes());
+    bytes.extend_from_slice(b"filler");
+    bytes.extend_from_slice(fresh.as_bytes());
+    bytes.extend_from_slice(b"trailer");
+
+    let (role, stats) = find_remnant_role(&bytes, "111111111", now);
+    let role = role.unwrap();
+    assert_eq!(role.name, "New");
+    assert_eq!(role.level, 64);
+    assert_eq!(role.region, "America");
+    assert_eq!(
+        stats,
+        RemnantStats {
+            candidates: 2,
+            role_hits: 2,
+            fresh_hits: 1,
+        }
+    );
 }

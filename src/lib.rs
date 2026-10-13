@@ -645,10 +645,12 @@ fn publish_loop(
         // New pid (fresh launch or restart) starts a new session clock.
         let fresh = !matches!(&session, Some(active) if active.pid == pid);
         if fresh {
-            if session.is_some() {
-                log::info(format!("game restarted (pid {pid}), starting new session"));
-            } else {
-                log::info(format!("game detected (pid {pid}), starting session"));
+            if !log::is_quiet() {
+                if session.is_some() {
+                    log::info(format!("game restarted (pid {pid}), starting new session"));
+                } else {
+                    log::info(format!("game detected (pid {pid}), starting session"));
+                }
             }
             announced_waiting_discord = false;
             announced_lost_discord = false;
@@ -712,10 +714,12 @@ fn publish_loop(
         }
 
         let refresh = db.as_mut().map(|db| db.refresh());
-        log::debug(format!(
-            "presence tick: pid {pid}, refresh {refresh:?}, degraded {}",
-            db.as_ref().is_some_and(|db| db.is_degraded())
-        ));
+        if log::is_verbose() {
+            log::debug(format!(
+                "presence tick: pid {pid}, refresh {refresh:?}, degraded {}",
+                db.as_ref().is_some_and(|db| db.is_degraded())
+            ));
+        }
         // Stale-but-validated data survives transient blips; only a clean
         // triage state (or no data ever) decides what publishes.
         let info = db.as_ref().and_then(|db| db.last_info());
@@ -767,19 +771,23 @@ fn publish_loop(
             .or(live.display_name)
             .or(info.and_then(|info| info.display_name.as_deref()))
             .is_some();
-        log::debug(format!(
-            "publish tier: {tier} (level data: {}, name: {}, login known: {}, static flag: {}, character: {})",
-            info.is_some(),
-            named,
-            live.uid_known,
-            args.static_fallback,
-            character.as_ref().map(|c| c.key).unwrap_or("none")
-        ));
-        if active.last_tier != Some(tier) {
-            log::info(format!(
-                "presence tier: {} -> {tier}",
-                active.last_tier.unwrap_or("none")
+        if log::is_verbose() {
+            log::debug(format!(
+                "publish tier: {tier} (level data: {}, name: {}, login known: {}, static flag: {}, character: {})",
+                info.is_some(),
+                named,
+                live.uid_known,
+                args.static_fallback,
+                character.as_ref().map(|c| c.key).unwrap_or("none")
             ));
+        }
+        if active.last_tier != Some(tier) {
+            if !log::is_quiet() {
+                log::info(format!(
+                    "presence tier: {} -> {tier}",
+                    active.last_tier.unwrap_or("none")
+                ));
+            }
             active.last_tier = Some(tier);
         }
         let Some(activity) = publish.into_activity() else {
@@ -825,7 +833,9 @@ fn publish_loop(
                 ) {
                     match official.set_activity(official_pid, companion) {
                         Ok(()) => {
-                            log::debug(format!("official slot sent ({} bytes)", body.len()));
+                            if log::is_verbose() {
+                                log::debug(format!("official slot sent ({} bytes)", body.len()));
+                            }
                             session.last_body = Some(body);
                             session.unchanged_streak = 0;
                             session.last_send = Some(Instant::now());
@@ -852,7 +862,9 @@ fn publish_loop(
         if presence::should_resend(active.last_body.as_deref(), &body, active.unchanged_streak) {
             match ipc.set_activity(pid, activity) {
                 Ok(()) => {
-                    log::debug(format!("presence sent ({} bytes)", body.len()));
+                    if log::is_verbose() {
+                        log::debug(format!("presence sent ({} bytes)", body.len()));
+                    }
                     active.last_body = Some(body);
                     active.unchanged_streak = 0;
                     active.last_send = Some(Instant::now());
